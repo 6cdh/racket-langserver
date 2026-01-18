@@ -15,7 +15,6 @@
                "racket-index" ;; for cross references (setup/xref)
                "html-parsing" ;; for parsing documentation text
                "typed-racket-lib"
-               "racket/treelist"
                ))
 (define build-deps '("chk-lib"))
 (define pkg-desc "Language Server Protocol implementation for Racket.")
