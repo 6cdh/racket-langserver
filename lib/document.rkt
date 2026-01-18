@@ -1,14 +1,16 @@
-#lang typed/racket
+#lang typed/racket/base
 
 (provide (struct-out Document)
          make-document)
 
+(require "textbuffer.rkt")
+
 (struct Document
   ([uri : String]
-   [buffer : String]
+   [buffer : TextBuffer]
    [analysis : (Option Any)]))
 
 (: make-document (String String -> Document))
-(define (make-document uri buffer)
-  (Document uri buffer #f))
+(define (make-document uri text)
+  (Document uri (make-textbuffer text) #f))
 
