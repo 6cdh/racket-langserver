@@ -21,7 +21,8 @@
          json
          drracket/check-syntax
          syntax/modread
-         "base/rwlock.rkt")
+         "base/rwlock.rkt"
+         "../lib/document.rkt")
 
 ;; SafeDoc has two eliminator:
 ;; with-read-doc: access Doc within a reader lock.
@@ -32,7 +33,7 @@
   #:transparent)
 
 (struct Doc
-  (uri text trace version trace-version)
+  (uri text trace version trace-version lib)
   #:mutable)
 
 ;; the only place where really run check-syntax
@@ -63,7 +64,7 @@
   (send doc-text insert text 0)
   ;; the init trace should not be #f
   (define doc-trace (new build-trace% [src (uri->path uri)] [doc-text doc-text] [indenter #f]))
-  (define doc (Doc uri doc-text doc-trace version #f))
+  (define doc (Doc uri doc-text doc-trace version #f (make-document uri text)))
   (define safe-doc (SafeDoc doc (make-rwlock)))
   safe-doc)
 
