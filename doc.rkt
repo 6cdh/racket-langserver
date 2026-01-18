@@ -22,7 +22,7 @@
          drracket/check-syntax
          syntax/modread
          "base/rwlock.rkt"
-         "../lib/document.rkt")
+         "lib/document.rkt")
 
 ;; SafeDoc has two eliminator:
 ;; with-read-doc: access Doc within a reader lock.
