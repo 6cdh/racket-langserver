@@ -9,7 +9,7 @@
 
 (require racket/treelist
          racket/match
-         lsptool/common/macro
+         "../base/macro.rkt"
          "type.rkt")
 
 (define-type CharTL (TreeListof Char))
