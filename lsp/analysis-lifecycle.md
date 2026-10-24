@@ -83,10 +83,17 @@ private records and collections; none imports or receives the controller:
 - `disk-reader.rkt`: `Disk-Reader`, ordered per-source disk reads and waiters.
 - `analysis-scheduler.rkt`: `Analysis-Scheduler`, shared queued/running attempts,
   FIFO dispatch, capacity, cancellation, and attempt completion.
+- `place-runner.rkt`: one session-owned reusable Check Syntax place, with lazy
+  startup, generation/job wire identities, hard cancellation, and a supervised
+  parent restoration thread. The scheduler is its only queue. The worker loop
+  in `../analysis-place.rkt` gives each job a fresh analysis namespace and
+  custodian and cleans up before replying. The parent restores the completed
+  trace and derives its product without repeating Check Syntax.
 - `supervised-worker.rkt`: `Supervised-Worker`, resource ownership, timeout and
-  premature-exit detection. It suppresses worker stdout and releases resources
-  before reporting a result. Cancelling work does not kill its supervisor;
-  a resulting late message is rejected by the reader or scheduler.
+  premature-exit detection for disk reads, Resyntax, and injected analyzers.
+  It suppresses worker stdout and releases resources before reporting a result.
+  Cancelling work does not kill its supervisor; a resulting late message is
+  rejected by the reader or scheduler.
 - `analysis-publisher.rkt`: `Analysis-Publisher`, document analysis installation,
   workspace contributions, diagnostics, and Resyntax publication. Buffer
   operations require the controller-held SafeDoc write lock.
@@ -119,6 +126,49 @@ The controller receives its publication workspace through `#:workspace`.
 The default remains the process's `current-workspace`, also used by existing
 workspace requests. Injecting a different publication workspace alone does not
 create an isolated LSP session; the request layer must use that same workspace.
+
+## Place execution
+
+Production Check Syntax uses one reusable place per session. The configured
+`#:analysis-slots` bound (four by default) still limits combined analysis and
+Resyntax attempts. Resyntax uses its separate executor, not this Check Syntax
+place. This scheduler does not create additional Check Syntax places.
+`#:analyze #f` selects the session's place runner; a procedure selects the
+supervised-thread analyzer path used by deterministic tests.
+The FIFO scheduler reserves a slot before launch. Its 90-second default deadline
+includes startup, collection, serialization, transfer, local document construction,
+and restoration. Queue waiting is outside the deadline. Worker stdout is
+suppressed from startup, including language loading and extraction.
+
+The runner retains its reservation through restoration. Cancelling queued work
+has no worker effect. Cancelling running place work signals its bridge; the
+consumer never waits for termination. The bridge kills and observes the place
+before releasing physical capacity and sending its terminal message. The scheduler
+counts cancelled place reservations against the shared bound until it consumes
+that message, including when dispatching Resyntax. When only
+parent restoration remains, cancellation stops that task and preserves the
+cleaned worker. A successful assignment returns its place for reuse; settlement
+only signals that assignment's handle and cannot kill a newer job. Shutdown
+prevents new dispatch and asynchronously retires both active and idle places.
+Bridges and retirement threads share the runner's owning custodian, so disposing
+the consumer's custodian cannot interrupt cleanup of its places.
+
+Replies contain worker generation and job IDs, success plus the completed trace,
+or normalized failure text. Read/expansion errors remain completed products with
+diagnostics. Unexpected execution, serialization, protocol, and restoration
+errors fail the attempt. A worker failure reply retires the place even after
+job cleanup: the exception may have left place-wide state inconsistent. A
+parent restoration failure preserves the worker that returned a normal result.
+A reply queued alongside worker death is considered before reporting premature
+exit. Cancelled attempts cannot accept late replies;
+source revision is checked again at acceptance before installation, publication,
+and shared completion.
+
+`tests/lsp/place-runner-test.rkt` uses real places and explicit assignment barriers
+for reuse, resource isolation, cancellation, timeout, startup failure, worker death,
+replacement, restoration failure, and late-reply rejection. The trace conversion
+contract and fidelity coverage remain in `doclib/doc-trace.rkt` and
+`tests/lib/trace-place-test.rkt`.
 
 ## Available results and fresh completion
 

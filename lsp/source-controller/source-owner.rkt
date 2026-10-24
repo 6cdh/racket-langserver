@@ -89,7 +89,9 @@
 (define (make-source-controller #:workspace [workspace current-workspace]
                                 #:read [read read-source-text]
                                 #:read-timeout [read-timeout 3]
-                                #:analyze [analyze analyze-source]
+                                ;; #f selects this session's Check Syntax place;
+                                ;; a procedure selects a supervised-thread analyzer.
+                                #:analyze [analyze #f]
                                 #:analysis-slots [slots 4]
                                 #:analysis-timeout [analysis-timeout 90]
                                 #:closed-analysis-limit [closed-analysis-limit 64]

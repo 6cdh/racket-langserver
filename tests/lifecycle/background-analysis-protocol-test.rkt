@@ -160,14 +160,17 @@
             (query "textDocument/hover" 70)
             (check-hover 70 3)
             (check-equal? (- (count root) dependency-count) 3)
-            ;; B stays held while an independent C completes Check Syntax and local
-            ;; queries. An edit to A cancels its imported request before release.
+            ;; This session has one analysis place, so finish C before holding B.
+            (open! c-uri "#lang racket/base\n(define independent 1)\nindependent\n" 0)
+            (send! "textDocument/semanticTokens/full" (hasheq 'textDocument (hasheq 'uri c-uri)) 71)
+            (check-true (pair? (hash-ref (result 71) 'data)))
+            ;; An edit to A cancels its imported request before release.
             (delete-file (build-path root "entered"))
             (delete-file (build-path root "release"))
             (write-text b (target-text root 4))
             (query "textDocument/definition" 8)
             (wait-entered root)
-            (open! c-uri "#lang racket/base\n(define independent 1)\nindependent\n" 0)
+            ;; B is held; C answers from its completed product.
             (send! "textDocument/semanticTokens/full" (hasheq 'textDocument (hasheq 'uri c-uri)) 9)
             (check-true (pair? (hash-ref (result 9) 'data)))
             (query "textDocument/definition" 10 c-uri (Pos 2 1))

@@ -116,7 +116,7 @@
   (define succeeded? (CSResult-succeed? check-syntax-result))
   (finalize-analysis doc trace succeeded?))
 
-;; Prototype receiving boundary. The submitted snapshot supplies source identity
+;; Production receiving boundary. The submitted snapshot supplies source identity
 ;; and text; the completed worker trace supplies facts, including error results.
 ;; The place channel has already established the payload's transferability.
 ;; Constructing the document performs local lexing, but never Check Syntax.

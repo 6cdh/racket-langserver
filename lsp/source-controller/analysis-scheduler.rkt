@@ -8,7 +8,8 @@
          "../../workspace/source-store.rkt"
          "../analysis.rkt"
          "completion-event.rkt"
-         "supervised-worker.rkt")
+         "supervised-worker.rkt"
+         "place-runner.rkt")
 
 (provide Analysis-Scheduler?
          make-analysis-scheduler
@@ -29,26 +30,34 @@
    [parent-completion (or/c #f evt?)]
    [completion Completion-Event?]
    [(state #:mutable) (or/c 'queued 'running 'terminal)]
-   [(worker #:mutable) (or/c #f Supervised-Worker?)]))
+   [(worker #:mutable) (or/c #f Supervised-Worker? Place-Task?)]))
 
 (struct/contract Analysis-Scheduler
   ([events async-channel?]
-   [analyze (-> Source-Snapshot? Analysis-Product?)]
+   ;; analyze is #f for this session's Check Syntax place; a procedure uses
+   ;; the supervised-thread path and leaves runner as #f.
+   [analyze (or/c #f (-> Source-Snapshot? Analysis-Product?))]
+   ;; runner is present exactly when analyze is #f.
+   [runner (or/c #f Place-Runner?)]
    [resyntax (or/c #f (-> string? string? list?))]
    [timeout (and/c real? (>=/c 0))]
    [slots exact-positive-integer?]
    [attempts (hash/c (cons/c Source-Id? (or/c 'analysis 'resyntax))
                      Analysis-Attempt? #:immutable #f)]
    [(queue #:mutable) (listof Analysis-Attempt?)]
+   ;; Cancelled place bridges still consume shared physical capacity until
+   ;; their termination message arrives, even though acceptance is revoked.
+   [(retiring #:mutable) (listof Analysis-Attempt?)]
    [(stopped? #:mutable) boolean?]))
 
 ;; The event envelope carries an identity privately; replay cannot revive an
 ;; attempt removed by completion, cancellation, or a same-revision retry.
 (struct Analysis-Completed (attempt result))
 
-(define (make-analysis-scheduler events #:analyze analyze #:resyntax resyntax
+(define (make-analysis-scheduler events #:analyze [analyze #f] #:resyntax resyntax
                                  #:timeout [timeout 90] #:slots [slots 4])
-  (Analysis-Scheduler events analyze resyntax timeout slots (make-hash) '() #f))
+  (Analysis-Scheduler events analyze (and (not analyze) (make-place-runner))
+                      resyntax timeout slots (make-hash) '() '() #f))
 
 (define (attempt-key attempt)
   (cons (Source-Snapshot-id (Analysis-Attempt-snapshot attempt))
@@ -98,7 +107,13 @@
 (define (settle! scheduler attempt outcome)
   (unless (eq? 'terminal (Analysis-Attempt-state attempt))
     (when (Analysis-Attempt-worker attempt)
-      (stop-supervised-worker! (Analysis-Attempt-worker attempt)))
+      (define worker (Analysis-Attempt-worker attempt))
+      (if (Place-Task? worker)
+          (begin
+            (set-Analysis-Scheduler-retiring!
+              scheduler (cons attempt (Analysis-Scheduler-retiring scheduler)))
+            (cancel-place-task! worker))
+          (stop-supervised-worker! worker)))
     (set-Analysis-Attempt-state! attempt 'terminal)
     (when (registered? scheduler attempt)
       (hash-remove! (Analysis-Scheduler-attempts scheduler) (attempt-key attempt)))
@@ -117,7 +132,9 @@
   (set-Analysis-Scheduler-stopped?! scheduler #t)
   (for ([attempt (in-list (hash-values (Analysis-Scheduler-attempts scheduler)))])
     (settle! scheduler attempt (Analysis-Outcome 'stopped 'shutdown)))
-  (set-Analysis-Scheduler-queue! scheduler '()))
+  (set-Analysis-Scheduler-queue! scheduler '())
+  (when (Analysis-Scheduler-runner scheduler)
+    (stop-place-runner! (Analysis-Scheduler-runner scheduler))))
 
 ;; current? checks source eligibility at dispatch, after any time spent queued.
 ;; It receives a snapshot and never receives the scheduler's private state.
@@ -126,10 +143,14 @@
     (let loop ()
       (define queue (Analysis-Scheduler-queue scheduler))
       (define running
-        (for/sum ([attempt (in-hash-values (Analysis-Scheduler-attempts scheduler))]
-                  #:when (eq? 'running (Analysis-Attempt-state attempt)))
-          1))
-      (when (and (pair? queue) (< running (Analysis-Scheduler-slots scheduler)))
+        (+ (length (Analysis-Scheduler-retiring scheduler))
+           (for/sum ([attempt (in-hash-values (Analysis-Scheduler-attempts scheduler))]
+                     #:when (eq? 'running (Analysis-Attempt-state attempt)))
+             1)))
+      (when (and (pair? queue) (< running (Analysis-Scheduler-slots scheduler))
+                 (or (not (Analysis-Scheduler-runner scheduler))
+                     (eq? 'resyntax (Analysis-Attempt-kind (car queue)))
+                     (place-runner-available? (Analysis-Scheduler-runner scheduler))))
         (define attempt (car queue))
         (set-Analysis-Scheduler-queue! scheduler (cdr queue))
         (if (and (registered? scheduler attempt)
@@ -143,16 +164,21 @@
   (set-Analysis-Attempt-state! attempt 'running)
   (define analysis? (eq? 'analysis (Analysis-Attempt-kind attempt)))
   (define worker
-    (start-supervised-worker!
-      (Analysis-Scheduler-events scheduler) (Analysis-Scheduler-timeout scheduler)
-      (if analysis?
-          (lambda () ((Analysis-Scheduler-analyze scheduler) snapshot))
-          (lambda () ((Analysis-Scheduler-resyntax scheduler)
-                      (Source-Snapshot-text snapshot) (Source-Snapshot-uri snapshot))))
-      #:fail (lambda (reason) (Analysis-Outcome 'failed reason))
-      #:exited 'worker-exited
-      #:timed-out 'analysis-timeout
-      #:done (lambda (result) (Analysis-Completed attempt result))))
+    (if (and analysis? (Analysis-Scheduler-runner scheduler))
+        (start-place-task! (Analysis-Scheduler-runner scheduler) snapshot
+                           (Analysis-Scheduler-events scheduler)
+                           (Analysis-Scheduler-timeout scheduler)
+                           (lambda (result) (Analysis-Completed attempt result)))
+        (start-supervised-worker!
+          (Analysis-Scheduler-events scheduler) (Analysis-Scheduler-timeout scheduler)
+          (if analysis?
+              (lambda () ((Analysis-Scheduler-analyze scheduler) snapshot))
+              (lambda () ((Analysis-Scheduler-resyntax scheduler)
+                          (Source-Snapshot-text snapshot) (Source-Snapshot-uri snapshot))))
+          #:fail (lambda (reason) (Analysis-Outcome 'failed reason))
+          #:exited 'worker-exited
+          #:timed-out 'analysis-timeout
+          #:done (lambda (result) (Analysis-Completed attempt result)))))
   (set-Analysis-Attempt-worker! attempt worker))
 
 ;; accept runs inline for the current running attempt only. It receives
@@ -161,7 +187,13 @@
 ;; domain failures. Only then may the shared completion become ready.
 (define (finish-analysis-task! scheduler message accept)
   (define attempt (Analysis-Completed-attempt message))
+  (set-Analysis-Scheduler-retiring!
+    scheduler (remq attempt (Analysis-Scheduler-retiring scheduler)))
   (when (and (registered? scheduler attempt) (eq? 'running (Analysis-Attempt-state attempt)))
+    ;; The bridge has released job resources before reporting completion.
+    ;; Successful settlement must not abort a reusable worker or reserve a
+    ;; second retirement slot for an already-finished assignment.
+    (set-Analysis-Attempt-worker! attempt #f)
     (define outcome
       (accept (Analysis-Attempt-snapshot attempt) (Analysis-Attempt-kind attempt)
               (Analysis-Attempt-completion attempt) (Analysis-Attempt-parent-completion attempt)
