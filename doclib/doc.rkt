@@ -235,6 +235,14 @@
                                 (text-edit-end doc edit)
                                 (TextEdit-newText edit)))))
 
+;; Restore analysis data into a fresh document's normally constructed trace.
+;; Acceptance/version installation still belongs to doc-update-trace!.
+(define/contract (doc-deserialize-trace! doc data)
+  (-> Doc? any/c (is-a?/c build-trace%))
+  (define trace (Doc-trace doc))
+  (send trace deserialize! data)
+  trace)
+
 (define/contract (doc-expand source doc-text lexer-state)
   (-> Source? (is-a?/c lsp-editor%) LexerState? CSResult?)
   (check-syntax source doc-text lexer-state))
@@ -1275,6 +1283,7 @@
          doc-language-policy
          doc-body-forest
          doc-expand
+         doc-deserialize-trace!
          doc-detach-analysis!
          doc-update-trace!
          doc-trace-latest?

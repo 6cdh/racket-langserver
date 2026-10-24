@@ -12,6 +12,8 @@
 
 (require racket/class
          racket/list
+         racket/match
+         "../../common/json-util.rkt"
          "interface.rkt"
          "char-range-edit.rkt"
          "../inlay-hint-source.rkt"
@@ -72,6 +74,27 @@
 
     (define pre-syntax #f)
     (define groups '())
+
+    ;; Preserve source spans as well as anchors: edits invalidate whole groups.
+    ;; pre-syntax has already been consumed by build! and is never transported.
+    (define/override (serialize)
+      (for/list ([group (in-list groups)])
+        (list
+          (for/list ([range (in-list (Inlay-Hint-Group-sources group))])
+            (list (CharRange-start range) (CharRange-end range)))
+          (for/list ([anchor (in-list (Inlay-Hint-Group-anchors group))])
+            (list (Inlay-Hint-Anchor-pos anchor) (->jsexpr (Inlay-Hint-Anchor-kind anchor))
+                  (Inlay-Hint-Anchor-label anchor) (Inlay-Hint-Anchor-tooltip anchor))))))
+
+    (define/override (deserialize! data)
+      (set! groups
+            (for/list ([entry (in-list data)])
+              (match-define (list sources anchors) entry)
+              (Inlay-Hint-Group
+                (for/list ([range (in-list sources)]) (apply CharRange range))
+                (for/list ([anchor (in-list anchors)])
+                  (match-define (list pos kind label tooltip) anchor)
+                  (Inlay-Hint-Anchor pos (jsexpr->InlayHintKind kind) label tooltip))))))
 
     ;; The hints drawn in [req-start, req-end), in the order they were read.
     (define/public (hints-in-range req-start req-end)

@@ -1,6 +1,8 @@
 #lang racket/base
 
 (require "interface.rkt"
+         "interval-map-snapshot.rkt"
+         "../../common/json-util.rkt"
          racket/class
          racket/string
          racket/set
@@ -38,6 +40,15 @@
         (add-diag! d)))
 
     (define quickfixs (make-interval-map))
+
+    (define/override (serialize)
+      (list (map ->jsexpr (set->list diags))
+            (interval-map->snapshot quickfixs ->jsexpr)))
+
+    (define/override (deserialize! data)
+      (match-define (list saved-diags saved-quickfixs) data)
+      (set! diags (list->mutable-seteq (map jsexpr->Diagnostic saved-diags)))
+      (set! quickfixs (snapshot->interval-map saved-quickfixs jsexpr->CodeAction)))
 
     (define/override (get)
       (list diags quickfixs))

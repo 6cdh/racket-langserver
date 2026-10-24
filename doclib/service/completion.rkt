@@ -12,6 +12,12 @@
     (super-new)
     (define completions (list))
 
+    ;; Completed candidates contain symbols only; no expansion state is kept.
+    (define/override (serialize) completions)
+
+    (define/override (deserialize! data)
+      (set! completions data))
+
     (define/override (get)
       completions)
 

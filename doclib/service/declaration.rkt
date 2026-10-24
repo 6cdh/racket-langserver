@@ -25,6 +25,7 @@
 ;; document.
 
 (require "interface.rkt"
+         "interval-map-snapshot.rkt"
          "char-range-edit.rkt"
          "interval-map-edit.rkt"
          "position-journal.rkt"
@@ -57,6 +58,33 @@
   (key use-start use-end)
   #:transparent)
 
+(define (owner->datum owner)
+  (match owner
+    [(? exact-nonnegative-integer?) owner]
+    [(struct* Module-Binding ([filepath path] [submods submods] [phase+space phase] [id id]))
+     (list 'binding path submods phase id)]
+    [(struct* Module-Lang-Use-Key
+       ([language-start start] [language-end end] [phase-level phase] [use-text text]))
+     (list 'language start end phase text)]))
+
+(define (datum->owner data)
+  (match data
+    [(? exact-nonnegative-integer?) data]
+    [(list 'binding path submods phase id) (Module-Binding path submods phase id)]
+    [(list 'language start end phase text) (Module-Lang-Use-Key start end phase text)]))
+
+(define (restore-id-owners entries)
+  (make-hash
+    (for/list ([entry (in-list entries)])
+      (match-define (list id owner) entry)
+      (cons id (datum->owner owner)))))
+
+(define (restore-owner-keyed entries)
+  (make-hash
+    (for/list ([entry (in-list entries)])
+      (match-define (list owner value) entry)
+      (cons (datum->owner owner) value))))
+
 (define declaration%
   (class base-service%
     (init-field source doc-text)
@@ -79,11 +107,48 @@
     ;; `'module-lang` uses held until walk-stx.
     (define pending-module-lang-uses '())
 
+    ;; Completed queries and edits allocate no IDs. Recollection follows reset,
+    ;; which clears the graph, so this collection-only counter is not restored.
     (define fresh-id!
       (let ([id 0])
         (lambda ()
           (begin0 id
             (set! id (add1 id))))))
+
+    ;; All graph references use snapshot-local IDs or explicitly encoded owners.
+    ;; walk-stx has resolved pending module-language uses. The fresh receiving
+    ;; journal is empty; snapshot ranges remain the baseline for later edits.
+    (define/override (serialize)
+      (hash 'definitions (interval-map->snapshot def-at-position)
+            'uses (interval-map->snapshot use-at-position)
+            'ranges (for/list ([(id range) (in-hash id->range)])
+                      (list id (CharRange-start range) (CharRange-end range)))
+            'definition-uses
+            (for/list ([(owner ids) (in-hash def->use-ids)])
+              (list (owner->datum owner) ids))
+            'use-definitions
+            (for/list ([(id owner) (in-hash use->def)]) (list id (owner->datum owner)))
+            'binding-definitions
+            (for/list ([(binding id) (in-hash module-binding->def-id)])
+              (list (owner->datum binding) id))
+            'definition-bindings
+            (for/list ([(id binding) (in-hash def-id->module-binding)])
+              (list id (owner->datum binding)))))
+
+    (define/override (deserialize! data)
+      (set! def-at-position (snapshot->interval-map (hash-ref data 'definitions)))
+      (set! use-at-position (snapshot->interval-map (hash-ref data 'uses)))
+      (set! id->range
+            (make-hash
+              (for/list ([entry (in-list (hash-ref data 'ranges))])
+                (match-define (list id start end) entry)
+                (cons id (CharRange start end)))))
+      (set! def->use-ids
+            (restore-owner-keyed (hash-ref data 'definition-uses)))
+      (set! use->def (restore-id-owners (hash-ref data 'use-definitions)))
+      (set! module-binding->def-id
+            (restore-owner-keyed (hash-ref data 'binding-definitions)))
+      (set! def-id->module-binding (restore-id-owners (hash-ref data 'definition-bindings))))
 
     ;; Lexical arrows and jumps treat a zero-width Check Syntax report as a
     ;; one-character range. Module-language arrows do not call this function.

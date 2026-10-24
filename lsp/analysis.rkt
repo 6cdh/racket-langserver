@@ -18,6 +18,7 @@
          "../workspace/source-store.rkt")
 
 (provide analyze-source
+         restore-analysis
          (struct-out Analysis-Summary)
          (struct-out Analysis-Product)
          (struct-out Analysis-Outcome)
@@ -113,6 +114,21 @@
   (define check-syntax-result (doc-check-syntax doc))
   (define trace (CSResult-trace check-syntax-result))
   (define succeeded? (CSResult-succeed? check-syntax-result))
+  (finalize-analysis doc trace succeeded?))
+
+;; Prototype receiving boundary. The submitted snapshot supplies source identity
+;; and text; the completed worker trace supplies facts, including error results.
+;; The place channel has already established the payload's transferability.
+;; Constructing the document performs local lexing, but never Check Syntax.
+(define/contract (restore-analysis snapshot succeeded? data)
+  (-> Source-Snapshot? boolean? any/c Analysis-Product?)
+  (define doc (make-source-doc (Source-Snapshot-source snapshot) (Source-Snapshot-text snapshot)))
+  (define trace (doc-deserialize-trace! doc data))
+  (finalize-analysis doc trace succeeded?))
+
+;; Shared by direct collection and restoration so diagnostics, summaries, and
+;; contributions follow the same installation and extraction rules.
+(define (finalize-analysis doc trace succeeded?)
   (define contribution (and succeeded? (send trace get-contribution)))
   (when succeeded?
     (doc-update-trace! doc trace contribution (Doc-version doc)))

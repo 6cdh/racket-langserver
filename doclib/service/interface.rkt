@@ -10,6 +10,8 @@
 (define service<%>
   (interface (syncheck-annotations<%>)
     get
+    serialize
+    deserialize!
     text-replaced
     expand
     contract
@@ -27,6 +29,12 @@
     ;; return data
     (define/public (get)
       #f)
+
+    (define/public (serialize)
+      #f)
+
+    (define/public (deserialize! data)
+      (void))
 
     ;; text between start and end (exclusive) was replaced. Sent before
     ;; `expand`/`contract`, in the positions the document had before the edit.

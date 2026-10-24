@@ -8,6 +8,8 @@
 ;; language-independent (see get-warn-diags in doc-trace.rkt).
 
 (require "../interface.rkt"
+         "../interval-map-snapshot.rkt"
+         "../../../common/json-util.rkt"
          "../tooltip-log.rkt"
          "../../../common/interfaces.rkt"
          racket/class
@@ -28,6 +30,15 @@
       (make-interval-map))
     (define diagnostics
       (mutable-seteq))
+
+    (define/override (serialize)
+      (list (interval-map->snapshot type-by-range)
+            (map ->jsexpr (set->list diagnostics))))
+
+    (define/override (deserialize! data)
+      (match-define (list types saved-diagnostics) data)
+      (set! type-by-range (snapshot->interval-map types))
+      (set! diagnostics (list->mutable-seteq (map jsexpr->Diagnostic saved-diagnostics))))
 
     ;; Return start/end/text only. Callers must not hold or mutate the
     ;; interval-map while expand/contract shifts ranges during an edit.

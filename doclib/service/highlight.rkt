@@ -1,6 +1,8 @@
 #lang racket/base
 
 (require drracket/check-syntax
+         "interval-map-snapshot.rkt"
+         "../../common/json-util.rkt"
          syntax/parse
          "../../common/interfaces.rkt"
          "../internal-types.rkt"
@@ -20,6 +22,24 @@
     (init-field src doc-text)
     (define styles '())
     (define token-map (make-interval-map))
+
+    (define/override (serialize)
+      (interval-map->snapshot
+        token-map
+        (lambda (token)
+          (list (SemanticToken-start token) (SemanticToken-end token)
+                (->jsexpr (SemanticToken-type token))
+                (map ->jsexpr (SemanticToken-modifiers token))))))
+
+    (define/override (deserialize! data)
+      ;; styles is collection-only; queries and edits use token-map.
+      (set! token-map
+            (snapshot->interval-map
+              data
+              (match-lambda
+                [(list start end type modifiers)
+                 (SemanticToken start end (jsexpr->SemanticTokenType type)
+                                (map jsexpr->SemanticTokenModifier modifiers))]))))
 
     (define/override (get)
       (interval-map->token-lst token-map))

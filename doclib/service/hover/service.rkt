@@ -12,11 +12,13 @@
 ;; and comment scanning run when the trace is built, not on each hover request.
 
 (require "../interface.rkt"
+         "../interval-map-snapshot.rkt"
          "../../internal-types.rkt"
          "types.rkt"
          "detail.rkt"
          "../position-journal.rkt"
          racket/class
+         racket/match
          racket/set
          data/interval-map
          drracket/check-syntax
@@ -37,6 +39,20 @@
 (struct Stored-Hover-Annotation
   (annotation source-span)
   #:transparent)
+
+(define (detail->datum detail)
+  (list (for/list ([line (in-list (Hover-Detail-comment-lines detail))])
+          (list (Hover-Comment-Line-start line) (Hover-Comment-Line-end line)
+                (Hover-Comment-Line-truncated? line)))
+        (Hover-Detail-comments-truncated? detail)
+        (Hover-Detail-source-start detail) (Hover-Detail-display-start detail)
+        (Hover-Detail-display-end detail) (Hover-Detail-source-end detail)
+        (Hover-Detail-fence-language detail)))
+
+(define (datum->detail data)
+  (match-define (list lines truncated? source-start display-start display-end source-end fence) data)
+  (Hover-Detail (for/list ([line (in-list lines)]) (apply Hover-Comment-Line line))
+                truncated? source-start display-start display-end source-end fence))
 
 (define hover%
   (class base-service%
@@ -67,6 +83,28 @@
           [else 'none])))
     (define fence-language
       (if (eq? source-kind 'rhombus) "rhombus" "racket"))
+
+    ;; Only completed, unedited snapshots are supported. The receiving journal
+    ;; starts empty; collection targets and comment caches are no longer read.
+    (define/override (serialize)
+      (list
+        (interval-map->snapshot
+          mouse-over-by-range
+          (lambda (stored)
+            (define annotation (Stored-Hover-Annotation-annotation stored))
+            (list (Hover-Annotation-kind annotation) (Hover-Annotation-text annotation)
+                  (Stored-Hover-Annotation-source-span stored))))
+        (interval-map->snapshot detail-by-range detail->datum)))
+
+    (define/override (deserialize! data)
+      (match-define (list annotations details) data)
+      (set! mouse-over-by-range
+            (snapshot->interval-map
+              annotations
+              (match-lambda
+                [(list kind text span)
+                 (Stored-Hover-Annotation (Hover-Annotation kind text) span)])))
+      (set! detail-by-range (snapshot->interval-map details datum->detail)))
 
     ;; Do not expose interval-maps. Bounds are the atomic range over which this
     ;; exact winner remains active.

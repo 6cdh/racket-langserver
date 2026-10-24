@@ -1,6 +1,7 @@
 #lang racket/base
 
 (require "interface.rkt"
+         "interval-map-snapshot.rkt"
          racket/class
          "../docs-helpers.rkt"
          data/interval-map
@@ -13,6 +14,12 @@
   (class base-service%
     (super-new)
     (define docs (make-interval-map))
+
+    ;; Links and Scribble definition tags are already plain data.
+    (define/override (serialize) (interval-map->snapshot docs))
+
+    (define/override (deserialize! data)
+      (set! docs (snapshot->interval-map data)))
 
     (define/override (get)
       docs)

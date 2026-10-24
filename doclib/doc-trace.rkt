@@ -52,16 +52,31 @@
         [declaration decls]
         [typed-racket typed-racket]))
 
-    (define services
-      (list hovers
-            docs
-            completions
-            requires
-            diag
-            typed-racket
-            decls
-            semantic-tokens
-            inlay-hints))
+    (define trace-payloads
+      (list (cons 'hover hovers)
+            (cons 'documentation docs)
+            (cons 'completion completions)
+            (cons 'require requires)
+            (cons 'diagnostic diag)
+            (cons 'typed-racket typed-racket)
+            (cons 'declaration decls)
+            (cons 'highlight semantic-tokens)
+            (cons 'inlay-hints inlay-hints)))
+
+    (define services (map cdr trace-payloads))
+
+    ;; Freshly completed Check Syntax traces only, before any editor mutation.
+    ;; Service payloads contain analysis data, never source/editor/service objects.
+    ;; Construction in the receiving place supplies those dependencies normally.
+    (define/public (serialize)
+      (for/hash ([payload (in-list trace-payloads)])
+        (values (car payload) (send (cdr payload) serialize))))
+
+    ;; Restore into a newly constructed trace. This does not collect syntax,
+    ;; resolve modules, or build hints; finalization already ran in the worker.
+    (define/public (deserialize! data)
+      (for ([payload (in-list trace-payloads)])
+        (send (cdr payload) deserialize! (hash-ref data (car payload)))))
 
     (define/public (reset)
       (for ([s services])
