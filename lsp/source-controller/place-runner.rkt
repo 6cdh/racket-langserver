@@ -1,7 +1,7 @@
 #lang racket/base
 
-;; One session-owned reusable place, with no pending queue. The scheduler
-;; reserves it before launch. A bridge supervises startup through restoration,
+;; Session-owned reusable places, with no pending queue. The scheduler
+;; reserves a slot before launch. A bridge supervises startup through restoration,
 ;; and retains the reservation until cancelled places have terminated.
 (require racket/async-channel
          racket/match
@@ -31,7 +31,8 @@
 ;; Test factories still create real places. They can establish startup barriers
 ;; or substitute a wire peer without transporting an analysis closure.
 (define current-place-factory (make-parameter spawn-worker))
-(module+ test-support (provide current-place-factory))
+(define current-analysis-restorer (make-parameter restore-analysis))
+(module+ test-support (provide current-place-factory current-analysis-restorer))
 
 ;; One physical place. id is its creating job's ID and stays fixed while later
 ;; jobs advance Place-Runner's counter. A replacement records its own creating
@@ -42,15 +43,19 @@
 ;; worker: #f until startup returns its place handle.
 (struct Generation (id custodian [worker #:mutable]))
 (struct Place-Task (cancel))
+;; Each slot stays reserved through restoration or observed retirement, so both
+;; physical places and parent-side work remain bounded by the configured capacity.
+(struct Worker-Slot ([generation #:mutable] [task #:mutable]))
 ;; owner-custodian owns both places and their cleanup bridges.
 ;; serial is the increasing job counter; new generations use their first job ID.
-;; task reserves this runner through restoration or observed retirement.
-(struct Place-Runner (lock owner-custodian [generation #:mutable] [serial #:mutable]
-                           [task #:mutable] [stopped? #:mutable]))
+(struct Place-Runner (lock owner-custodian slots [serial #:mutable] [stopped? #:mutable]))
 
-;; (-> Place-Runner?)
-(define (make-place-runner)
-  (Place-Runner (make-semaphore 1) (current-custodian) #f 0 #f #f))
+;; (->* () (#:slots exact-positive-integer?) Place-Runner?)
+(define (make-place-runner #:slots [slots 1])
+  (unless (exact-positive-integer? slots)
+    (raise-argument-error 'make-place-runner "exact-positive-integer?" slots))
+  (Place-Runner (make-semaphore 1) (current-custodian)
+                (for/list ([_ (in-range slots)]) (Worker-Slot #f #f)) 0 #f))
 
 (define (locked runner proc)
   (call-with-semaphore (Place-Runner-lock runner) proc))
@@ -63,7 +68,8 @@
 ;; (-> Place-Runner? boolean?)
 (define (place-runner-available? runner)
   (locked runner (lambda () (and (not (Place-Runner-stopped? runner))
-                                 (not (Place-Runner-task runner))))))
+                                 (for/or ([slot (in-list (Place-Runner-slots runner))])
+                                   (not (Worker-Slot-task slot)))))))
 
 ;; (-> Place-Task? void?)
 (define (cancel-place-task! task)
@@ -87,15 +93,19 @@
     (locked runner
             (lambda ()
               (set-Place-Runner-stopped?! runner #t)
-              (cond
-                [(Place-Runner-task runner)
-                 (cancel-place-task! (Place-Runner-task runner))
-                 #f]
-                [else
-                 (define generation (Place-Runner-generation runner))
-                 (set-Place-Runner-generation! runner #f)
-                 generation]))))
-  (when idle (runner-thread runner (lambda () (retire-generation! runner idle))))
+              (for/fold ([idle '()]) ([slot (in-list (Place-Runner-slots runner))])
+                (define task (Worker-Slot-task slot))
+                (define generation (Worker-Slot-generation slot))
+                (cond
+                  [task
+                   (cancel-place-task! task)
+                   idle]
+                  [generation
+                   (set-Worker-Slot-generation! slot #f)
+                   (cons generation idle)]
+                  [else idle])))))
+  (for ([generation (in-list idle)])
+    (runner-thread runner (lambda () (retire-generation! runner generation))))
   (void))
 
 (define (failure reason)
@@ -127,7 +137,7 @@
      ;; Job resources are gone. Restoration failure or cancellation still
      ;; reuses this place.
      (set-box! place-reusable? #t)
-     (restore-analysis snapshot succeeded? data)]
+     ((current-analysis-restorer) snapshot succeeded? data)]
     [(list (== (Generation-id generation)) (== job) (list 'failure (? string? detail)))
      ;; Cleanup ran, but the exception may have touched place-wide state outside
      ;; the job custodian. Fail the attempt and retire this place.
@@ -141,23 +151,27 @@
 (define (start-place-task! runner snapshot events seconds done)
   (define deadline (+ (current-deadline-milliseconds) (* 1000 seconds)))
   (define task (Place-Task (make-semaphore 0)))
-  (define-values (generation retired job)
+  (define-values (slot generation retired job)
     (locked runner
             (lambda ()
-              (when (or (Place-Runner-stopped? runner) (Place-Runner-task runner))
+              (define slot
+                (for/first ([slot (in-list (Place-Runner-slots runner))]
+                            #:unless (Worker-Slot-task slot))
+                  slot))
+              (when (or (Place-Runner-stopped? runner) (not slot))
                 (error 'start-place-task! "runner is unavailable"))
               (set-Place-Runner-serial! runner (add1 (Place-Runner-serial runner)))
               (define job (Place-Runner-serial runner))
-              (define previous (Place-Runner-generation runner))
+              (define previous (Worker-Slot-generation slot))
               (define dead?
                 (and previous (Generation-worker previous)
                      (sync/timeout 0 (place-dead-evt (Generation-worker previous)))))
               (when (or (not previous) dead?)
-                (set-Place-Runner-generation!
-                  runner (Generation job
-                                     (make-custodian (Place-Runner-owner-custodian runner)) #f)))
-              (set-Place-Runner-task! runner task)
-              (values (Place-Runner-generation runner) (and dead? previous) job))))
+                (set-Worker-Slot-generation!
+                  slot (Generation job
+                                   (make-custodian (Place-Runner-owner-custodian runner)) #f)))
+              (set-Worker-Slot-task! slot task)
+              (values slot (Worker-Slot-generation slot) (and dead? previous) job))))
   (runner-thread
     runner
     (lambda ()
@@ -193,7 +207,7 @@
         (locked runner
                 (lambda ()
                   (define retire? (or (not (unbox place-reusable?)) (Place-Runner-stopped? runner)))
-                  (unless retire? (set-Place-Runner-task! runner #f))
+                  (unless retire? (set-Worker-Slot-task! slot #f))
                   retire?)))
       ;; Keep the runner lock released across place-wait so shutdown and
       ;; dispatch never wait on termination while acquiring that lock.
@@ -201,8 +215,8 @@
         (retire-generation! runner generation)
         (locked runner
                 (lambda ()
-                  (set-Place-Runner-generation! runner #f)
-                  (set-Place-Runner-task! runner #f))))
+                  (set-Worker-Slot-generation! slot #f)
+                  (set-Worker-Slot-task! slot #f))))
       ;; Includes cancellation: the stale completion wakes dispatch only after
       ;; physical capacity is free. Acceptance still checks attempt identity.
       (async-channel-put events (done result))))

@@ -56,7 +56,7 @@
 
 (define (make-analysis-scheduler events #:analyze [analyze #f] #:resyntax resyntax
                                  #:timeout [timeout 90] #:slots [slots 4])
-  (Analysis-Scheduler events analyze (and (not analyze) (make-place-runner))
+  (Analysis-Scheduler events analyze (and (not analyze) (make-place-runner #:slots slots))
                       resyntax timeout slots (make-hash) '() '() #f))
 
 (define (attempt-key attempt)

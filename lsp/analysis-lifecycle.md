@@ -83,9 +83,9 @@ private records and collections; none imports or receives the controller:
 - `disk-reader.rkt`: `Disk-Reader`, ordered per-source disk reads and waiters.
 - `analysis-scheduler.rkt`: `Analysis-Scheduler`, shared queued/running attempts,
   FIFO dispatch, capacity, cancellation, and attempt completion.
-- `place-runner.rkt`: one session-owned reusable Check Syntax place, with lazy
-  startup, generation/job wire identities, hard cancellation, and a supervised
-  parent restoration thread. The scheduler is its only queue. The worker loop
+- `place-runner.rkt`: session-owned bounded Check Syntax place pool, with lazy
+  startup, generation/job wire identities, hard cancellation, and supervised
+  parent restoration threads. The scheduler is its only queue. The worker loop
   in `../analysis-place.rkt` gives each job a fresh analysis namespace and
   custodian and cleans up before replying. The parent restores the completed
   trace and derives its product without repeating Check Syntax.
@@ -129,10 +129,13 @@ create an isolated LSP session; the request layer must use that same workspace.
 
 ## Place execution
 
-Production Check Syntax uses one reusable place per session. The configured
-`#:analysis-slots` bound (four by default) still limits combined analysis and
-Resyntax attempts. Resyntax uses its separate executor, not this Check Syntax
-place. This scheduler does not create additional Check Syntax places.
+Production Check Syntax uses a session-owned pool of reusable places, created
+lazily up to `#:analysis-slots` (four by default). The scheduler retains the only
+FIFO job queue and limits combined Check Syntax and Resyntax attempts to that
+capacity. Each pool slot holds at most one place and stays reserved through
+parent restoration or observed place retirement; idle workers cannot cause
+additional restoration work to bypass the shared attempt bound. Resyntax uses
+its separate executor and shares the scheduler capacity.
 `#:analyze #f` selects the session's place runner; a procedure selects the
 supervised-thread analyzer path used by deterministic tests.
 The FIFO scheduler reserves a slot before launch. Its 90-second default deadline
@@ -166,7 +169,10 @@ and shared completion.
 
 `tests/lsp/place-runner-test.rkt` uses real places and explicit assignment barriers
 for reuse, resource isolation, cancellation, timeout, startup failure, worker death,
-replacement, restoration failure, and late-reply rejection. The trace conversion
+replacement, restoration failure, and late-reply rejection. Pool coverage checks
+concurrent assignments, shared FIFO capacity with Resyntax, cancellation during
+restoration, concurrent startup shutdown, and retained URI aliases through the
+controller with another place assignment still running. The trace conversion
 contract and fidelity coverage remain in `doclib/doc-trace.rkt` and
 `tests/lib/trace-place-test.rkt`.
 

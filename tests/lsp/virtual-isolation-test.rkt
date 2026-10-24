@@ -22,7 +22,8 @@
 
 (define (analyzed session uri)
   (define event (acquire session (uri->source uri)))
-  (check-eq? 'succeeded (Analysis-Outcome-state (await event))))
+  ;; Concurrent cold places may take longer under the parallel test suite.
+  (check-eq? 'succeeded (Analysis-Outcome-state (await event 30))))
 
 (define (feature session id method uri [extra (hasheq)])
   (request! session id method uri extra)

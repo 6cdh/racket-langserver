@@ -3,6 +3,10 @@
 (module+ test
   (require rackunit racket/async-channel racket/class racket/match racket/place racket/runtime-path
            "../../common/source.rkt"
+           "../../lsp/safedoc.rkt"
+           "../../lsp/source-controller.rkt"
+           (submod "../../lsp/source-controller.rkt" owner)
+           (only-in "controller-support.rkt" scratch drive-controller)
            "../../workspace/source-store.rkt"
            "../../lsp/analysis.rkt"
            "../../lsp/source-controller/place-runner.rkt"
@@ -17,12 +21,12 @@
   (define (snapshot [text "#lang racket/base\n(define value 1)\nvalue\n"])
     (Source-Snapshot (uri->source "untitled:runner.rkt") (gensym) 'buffer text))
 
-  (define (with-runner proc)
+  (define (with-runner proc #:slots [slots 1])
     (define custodian (make-custodian))
     (define spawned (make-async-channel))
     (define events (make-async-channel))
     (parameterize ([current-custodian custodian])
-      (define runner (make-place-runner))
+      (define runner (make-place-runner #:slots slots))
       (dynamic-wind
         void
         (lambda ()
@@ -244,3 +248,207 @@ RACKET
         (check-eq? (Analysis-Outcome-state (await events)) 'stopped)
         (check-not-false (sync/timeout 0 (place-dead-evt original-worker)))
         (check-false (place-runner-available? runner))))))
+
+(module+ test
+  (test-case "configured slots run concurrently and share FIFO capacity with Resyntax"
+    (with-runner
+      (lambda (_runner events spawned)
+        (define resyntax-started (make-async-channel))
+        (define release-resyntax (make-semaphore 0))
+        (define scheduler
+          (make-analysis-scheduler events #:slots 2
+                                   #:resyntax (lambda (_text _uri)
+                                                (async-channel-put resyntax-started #t)
+                                                (sync release-resyntax)
+                                                '())))
+        (define a (snapshot))
+        (define b (struct-copy Source-Snapshot (snapshot)
+                    [source (uri->source "untitled:second.rkt")]))
+        (define c (struct-copy Source-Snapshot (snapshot)
+                    [source (uri->source "untitled:third.rkt")]))
+        (define first (request-analysis! scheduler a))
+        (define second (request-analysis! scheduler b))
+        (schedule-resyntax! scheduler a first)
+        (define third (request-analysis! scheduler c))
+        (pump-analysis-scheduler! scheduler (lambda (_) #t))
+        (define-values (worker-a control-a) (await-worker spawned))
+        (define-values (worker-b control-b) (await-worker spawned))
+        ;; Both assignments arrive before either worker is released.
+        (await control-a)
+        (await control-b)
+        (pump-analysis-scheduler! scheduler (lambda (_) (error 'bound "third dispatch")))
+        (check-false (sync/timeout 0 spawned))
+        (release-and-count-resources! control-b)
+        (finish-analysis-task! scheduler (await events)
+                               (lambda args (Analysis-Outcome 'succeeded #f)))
+        (pump-analysis-scheduler! scheduler (lambda (_) #t))
+        (await resyntax-started)
+        ;; The freed worker is idle, but Resyntax owns the shared slot.
+        (pump-analysis-scheduler! scheduler (lambda (_) (error 'bound "Resyntax slot reused")))
+        (semaphore-post release-resyntax)
+        (finish-analysis-task! scheduler (await events)
+                               (lambda args (Analysis-Outcome 'succeeded #f)))
+        (pump-analysis-scheduler! scheduler (lambda (_) #t))
+        (await control-b)
+        (check-false (sync/timeout 0 spawned) "third analysis reuses the idle worker")
+        (release-and-count-resources! control-b)
+        (finish-analysis-task! scheduler (await events)
+                               (lambda args (Analysis-Outcome 'succeeded #f)))
+        (check-eq? (Analysis-Outcome-state (await third)) 'succeeded)
+        (release-and-count-resources! control-a)
+        (finish-analysis-task! scheduler (await events)
+                               (lambda args (Analysis-Outcome 'succeeded #f)))
+        (for ([completion (in-list (list first second))])
+          (check-eq? (Analysis-Outcome-state (await completion)) 'succeeded))
+        (stop-analysis-scheduler! scheduler)
+        (await (place-dead-evt worker-a))
+        (void (await (place-dead-evt worker-b))))
+      #:slots 2))
+
+  (test-case "restoration reserves capacity and cancellation preserves only its own cleaned place"
+    (with-runner
+      (lambda (runner events spawned)
+        (define restoring (make-async-channel))
+        (define old
+          (parameterize ([current-analysis-restorer
+                          (lambda args
+                            (async-channel-put restoring #t)
+                            (sync never-evt))])
+            (start runner events)))
+        (define-values (worker-a control-a) (await-worker spawned))
+        (await control-a)
+        (start runner events)
+        (define-values (worker-b control-b) (await-worker spawned))
+        (await control-b)
+        (release-and-count-resources! control-a)
+        (await restoring)
+        (check-false (place-runner-available? runner))
+        (check-exn #rx"unavailable" (lambda () (start runner events)))
+        (cancel-place-task! old)
+        (check-eq? (Analysis-Outcome-state (await events)) 'stopped)
+        (check-false (sync/timeout 0 (place-dead-evt worker-a)))
+        (start runner events)
+        (await control-a)
+        (cancel-place-task! old)
+        (release-and-count-resources! control-a)
+        (check-true (Analysis-Product-succeeded? (await events)))
+        (release-and-count-resources! control-b)
+        (check-true (Analysis-Product-succeeded? (await events)))
+        (check-false (sync/timeout 0 spawned))
+        (stop-place-runner! runner)
+        (await (place-dead-evt worker-a))
+        (void (await (place-dead-evt worker-b))))
+      #:slots 2))
+
+  (test-case "shutdown during concurrent startup kills all places and prevents replacement"
+    (with-runner
+      (lambda (runner events spawned)
+        (define factory (current-place-factory))
+        (define entered (make-async-channel))
+        (parameterize ([current-place-factory
+                        (lambda ()
+                          (define worker (factory))
+                          (async-channel-put entered #t)
+                          (sync never-evt)
+                          worker)])
+          (start runner events)
+          (start runner events))
+        (define-values (worker-a _control-a) (await-worker spawned))
+        (define-values (worker-b _control-b) (await-worker spawned))
+        (await entered)
+        (await entered)
+        (stop-place-runner! runner)
+        (for ([_ (in-range 2)])
+          (check-eq? (Analysis-Outcome-state (await events)) 'stopped))
+        (check-not-false (sync/timeout 0 (place-dead-evt worker-a)))
+        (check-not-false (sync/timeout 0 (place-dead-evt worker-b)))
+        (check-false (place-runner-available? runner))
+        (check-exn #rx"unavailable" (lambda () (start runner events)))
+        (check-false (sync/timeout 0 spawned)))
+      #:slots 2)))
+
+(module+ test
+  (test-case "pooled controller restores retained aliases and publishes before fresh completion"
+    (with-runner
+      (lambda (_runner _events spawned)
+        (define controller (make-source-controller #:analysis-slots 2 #:resyntax #f))
+        (dynamic-wind
+          void
+          (lambda ()
+            (define path (build-path scratch "pooled-retention.rkt"))
+            (define source (path->source path))
+            (define uri (source-uri source))
+            (define alias (regexp-replace #rx"^file://" uri "file://localhost"))
+            (define text "#lang racket/base\n(define value 1)\nvalue\n")
+            (define sd (new-safedoc uri text 7))
+            (define publications '())
+            (define pending #f)
+            (source-controller-set-notifier!
+              controller
+              (lambda (_method params)
+                (when pending
+                  (check-false (sync/timeout 0 pending)
+                               "publication precedes shared completion"))
+                (set! publications (cons params publications))))
+            (source-controller-open! controller source sd)
+            (set! pending (with-read-safedoc sd SafeDoc-analysis-completion))
+            (define-values (worker-a control-a) (await-worker spawned))
+            (await control-a)
+            ;; Keep a second source running across close/reopen and restoration.
+            (define other-source (uri->source "untitled:pooled-peer.rkt"))
+            (define other (new-safedoc (source-uri other-source) text 0))
+            (source-controller-open! controller other-source other)
+            (define other-done (with-read-safedoc other SafeDoc-analysis-completion))
+            (define-values (_worker-b control-b) (await-worker spawned))
+            (await control-b)
+            (release-and-count-resources! control-a)
+            (check-eq? (Analysis-Outcome-state (drive-controller controller pending 30)) 'succeeded)
+            (set! pending #f)
+            (define trace (Analysis-Product-trace
+                            (Available-Analysis-product (with-read-safedoc sd SafeDoc-available))))
+            (source-controller-close! controller source sd)
+            (define reopened (new-safedoc alias text 7))
+            (source-controller-open! controller (uri->source alias) reopened)
+            (set! pending (with-read-safedoc reopened SafeDoc-analysis-completion))
+            (await control-a)
+            (check-eq? trace (Analysis-Product-trace
+                               (Available-Analysis-product
+                                 (with-read-safedoc reopened SafeDoc-available))))
+            (check-equal? (hash-ref (car publications) 'uri) alias)
+            (check-false (sync/timeout 0 pending))
+            (release-and-count-resources! control-a)
+            (check-eq? (Analysis-Outcome-state (drive-controller controller pending 30)) 'succeeded)
+            (check-equal? (hash-ref (car publications) 'uri) alias)
+            (check-equal? (length publications) 4)
+            (set! pending other-done)
+            (release-and-count-resources! control-b)
+            (check-eq? (Analysis-Outcome-state (drive-controller controller other-done 30)) 'succeeded)
+            (check-false (sync/timeout 0 spawned))
+            (check-false (sync/timeout 0 (place-dead-evt worker-a))))
+          (lambda () (source-controller-shutdown! controller))))
+      #:slots 2)))
+
+(module+ test
+  (test-case "hard cancellation replaces only its slot while a peer assignment stays live"
+    (with-runner
+      (lambda (runner events spawned)
+        (define cancelled (start runner events))
+        (define-values (worker-a control-a) (await-worker spawned))
+        (await control-a)
+        (start runner events)
+        (define-values (worker-b control-b) (await-worker spawned))
+        (await control-b)
+        (cancel-place-task! cancelled)
+        (check-eq? (Analysis-Outcome-state (await events)) 'stopped)
+        (check-not-false (sync/timeout 0 (place-dead-evt worker-a)))
+        (check-false (sync/timeout 0 (place-dead-evt worker-b)))
+        (start runner events)
+        (define-values (_replacement control-next) (await-worker spawned))
+        (await control-next)
+        (check-false (place-runner-available? runner))
+        (cancel-place-task! cancelled)
+        (release-and-count-resources! control-next)
+        (check-true (Analysis-Product-succeeded? (await events)))
+        (release-and-count-resources! control-b)
+        (check-true (Analysis-Product-succeeded? (await events))))
+      #:slots 2)))
