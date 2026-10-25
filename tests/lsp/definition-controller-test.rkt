@@ -19,6 +19,7 @@
          "../../doclib/doc.rkt"
          "../../doclib/internal-types.rkt"
          "../../lsp/analysis.rkt"
+         (submod "../../lsp/analysis.rkt" test-support)
          "../../lsp/analysis-query.rkt"
          (prefix-in text-document/ "../../lsp/text-document.rkt")
          "../../lsp/lsp.rkt"

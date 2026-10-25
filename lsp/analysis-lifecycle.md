@@ -84,7 +84,7 @@ private records and collections; none imports or receives the controller:
 - `analysis-scheduler.rkt`: `Analysis-Scheduler`, shared queued/running attempts,
   FIFO dispatch, capacity, cancellation, and attempt completion.
 - `place-runner.rkt`: session-owned bounded Check Syntax place pool, with lazy
-  startup, generation/job wire identities, hard cancellation, and supervised
+  startup, unique job wire identities, hard cancellation, and supervised
   parent restoration threads. The scheduler is its only queue. The worker loop
   in `../analysis-place.rkt` gives each job a fresh analysis namespace and
   custodian and cleans up before replying. The parent restores the completed
@@ -136,8 +136,12 @@ capacity. Each pool slot holds at most one place and stays reserved through
 parent restoration or observed place retirement; idle workers cannot cause
 additional restoration work to bypass the shared attempt bound. Resyntax uses
 its separate executor and shares the scheduler capacity.
-`#:analyze #f` selects the session's place runner; a procedure selects the
-supervised-thread analyzer path used by deterministic tests.
+`#:analyze #f` selects the session's place runner. The ordinary-thread Check
+Syntax implementation is no longer a production export: `analyze-source` lives
+in `analysis.rkt`'s `test-support` submodule for direct equivalence checks and
+the benchmark baseline. `#:analyze` still accepts a procedure as a deterministic
+test seam, supervised with the same attempt deadline. Production Resyntax and
+disk reads retain their ordinary-thread supervision.
 The FIFO scheduler reserves a slot before launch. Its 90-second default deadline
 includes startup, collection, serialization, transfer, local document construction,
 and restoration. Queue waiting is outside the deadline. Worker stdout is
@@ -150,14 +154,18 @@ before releasing physical capacity and sending its terminal message. The schedul
 counts cancelled place reservations against the shared bound until it consumes
 that message, including when dispatching Resyntax. When only
 parent restoration remains, cancellation stops that task and preserves the
-cleaned worker. A successful assignment returns its place for reuse; settlement
-only signals that assignment's handle and cannot kill a newer job. Shutdown
+cleaned worker. A successful assignment returns its place for reuse. Logical
+settlement only removes the attempt and resolves its event; cancellation
+separately stops its worker. Each cancellation handle belongs to one assignment
+and cannot kill a newer job. Shutdown
 prevents new dispatch and asynchronously retires both active and idle places.
 Bridges and retirement threads share the runner's owning custodian, so disposing
 the consumer's custodian cannot interrupt cleanup of its places.
 
-Replies contain worker generation and job IDs, success plus the completed trace,
-or normalized failure text. Read/expansion errors remain completed products with
+Replies contain a job ID, success plus the completed trace,
+or normalized failure text. Job IDs increase across all slots and replacements
+within the runner, and each reply is read from its assigned place channel.
+Read/expansion errors remain completed products with
 diagnostics. Unexpected execution, serialization, protocol, and restoration
 errors fail the attempt. A worker failure reply retires the place even after
 job cleanup: the exception may have left place-wide state inconsistent. A
@@ -175,6 +183,23 @@ restoration, concurrent startup shutdown, and retained URI aliases through the
 controller with another place assignment still running. The trace conversion
 contract and fidelity coverage remain in `doclib/doc-trace.rkt` and
 `tests/lib/trace-place-test.rkt`.
+
+## Measurements and capacity
+
+[The benchmark and measured results](../bench/place-runner-results.md) compare
+one, two, and four slots with the ordinary-thread test baseline. They cover
+cold and warm batches, fresh and warm rapid-edit sessions, controller command
+latency, resident memory, and isolated conversion/transport probes. The report
+defines their boundaries; controller command latency is not full LSP request
+latency, and companion phase samples do not decompose production batch totals.
+
+Keep the four-slot default and lazy startup. The measured warm heavy batch
+benefits from four places, while first use and resident memory cost more than
+ordinary threads. These workload-specific samples do not establish a better
+universal capacity or justify allocating warm workers before demand. Hard
+cancellation still discards the executing place, so repeated cancellation can
+lose reuse. No prewarming, caching, payload optimization, or cooperative recovery
+is part of this migration.
 
 ## Available results and fresh completion
 

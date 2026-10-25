@@ -4,6 +4,7 @@
   (require rackunit
            "../../common/source.rkt"
            "../../lsp/analysis.rkt"
+           (submod "../../lsp/analysis.rkt" test-support)
            "../../lsp/source-controller/closed-analysis-cache.rkt"
            "../../workspace/source-store.rkt")
 

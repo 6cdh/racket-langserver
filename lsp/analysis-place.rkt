@@ -23,7 +23,7 @@
     (define CSResult-trace (dynamic-require syntax-path 'CSResult-trace))
     (define CSResult-succeed? (dynamic-require syntax-path 'CSResult-succeed?))
     (let loop ()
-      (match-define (list generation job uri text directory) (place-channel-get channel))
+      (match-define (list job uri text directory) (place-channel-get channel))
       (define custodian (make-custodian))
       (define reply
         (with-handlers ([(lambda (_) #t)
@@ -40,5 +40,5 @@
       (flush-output (current-error-port))
       ;; Never return a worker to the parent before job resources are gone.
       (custodian-shutdown-all custodian)
-      (place-channel-put channel (list generation job reply))
+      (place-channel-put channel (list job reply))
       (loop))))

@@ -18,6 +18,7 @@
          "../../doclib/doc.rkt"
          "../../doclib/internal-types.rkt"
          "../../lsp/analysis.rkt"
+         (submod "../../lsp/analysis.rkt" test-support)
          "../../workspace/source-store.rkt")
 
 (define-runtime-path worker-path "trace-place-worker.rkt")

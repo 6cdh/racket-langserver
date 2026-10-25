@@ -73,9 +73,8 @@ RACKET
           )
         (start runner events 30 (snapshot resource-probe))
         (define next (await control))
-        (check-equal? (car request) (car next))
-        (check-not-equal? (cadr request) (cadr next))
-        ;; Old settlement must not stop the new assignment on this same place.
+        (check-not-equal? (car request) (car next))
+        ;; Old cancellation must not stop the new assignment on this same place.
         (cancel-place-task! first)
         (check-equal? (release-and-count-resources! control) baseline)
         (define changed (await events))
@@ -197,13 +196,14 @@ RACKET
       (lambda (runner events spawned)
         (start runner events)
         (define-values (original-worker original-control) (await-worker spawned))
-        (await original-control)
+        (define original-request (await original-control))
         (release-and-count-resources! original-control 'reply-and-die)
         (check-true (Analysis-Product-succeeded? (await events)))
         (await (place-dead-evt original-worker))
         (start runner events)
         (define-values (_replacement-worker replacement-control) (await-worker spawned))
-        (await replacement-control)
+        (define replacement-request (await replacement-control))
+        (check-not-equal? (car original-request) (car replacement-request))
         (release-and-count-resources! replacement-control)
         (check-true (Analysis-Product-succeeded? (await events))))))
 
@@ -273,9 +273,11 @@ RACKET
         (pump-analysis-scheduler! scheduler (lambda (_) #t))
         (define-values (worker-a control-a) (await-worker spawned))
         (define-values (worker-b control-b) (await-worker spawned))
-        ;; Both assignments arrive before either worker is released.
-        (await control-a)
-        (await control-b)
+        ;; Both assignments arrive before either worker is released. Job IDs
+        ;; remain distinct across slots, not just successive uses of one place.
+        (define request-a (await control-a))
+        (define request-b (await control-b))
+        (check-not-equal? (car request-a) (car request-b))
         (pump-analysis-scheduler! scheduler (lambda (_) (error 'bound "third dispatch")))
         (check-false (sync/timeout 0 spawned))
         (release-and-count-resources! control-b)

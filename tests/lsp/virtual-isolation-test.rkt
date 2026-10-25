@@ -11,6 +11,7 @@
          "../../common/path-util.rkt"
          "../../doclib/internal-types.rkt"
          "../../lsp/analysis.rkt"
+         (submod "../../lsp/analysis.rkt" test-support)
          "../../lsp/source-controller.rkt"
          "../../workspace/api.rkt"
          "../../workspace/current.rkt"

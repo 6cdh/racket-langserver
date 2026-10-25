@@ -17,6 +17,7 @@
          "../../doclib/doc.rkt"
          "../../doclib/internal-types.rkt"
          "../../lsp/analysis.rkt"
+         (submod "../../lsp/analysis.rkt" test-support)
          "../../lsp/analysis-query.rkt"
          "../../lsp/lsp.rkt"
          "../../lsp/resyntax-place.rkt"

@@ -34,8 +34,8 @@
 
 (struct/contract Analysis-Scheduler
   ([events async-channel?]
-   ;; analyze is #f for this session's Check Syntax place; a procedure uses
-   ;; the supervised-thread path and leaves runner as #f.
+   ;; analyze is #f for production Check Syntax in this session's place pool.
+   ;; A test analyzer procedure runs in a supervised thread and leaves runner #f.
    [analyze (or/c #f (-> Source-Snapshot? Analysis-Product?))]
    ;; runner is present exactly when analyze is #f.
    [runner (or/c #f Place-Runner?)]
@@ -100,30 +100,36 @@
              (Analysis-Scheduler-resyntax scheduler))
     (define previous
       (hash-ref (Analysis-Scheduler-attempts scheduler) (cons (Source-Snapshot-id snapshot) 'resyntax) #f))
-    (when previous (settle! scheduler previous (Analysis-Outcome 'stopped 'superseded)))
+    (when previous (cancel-attempt! scheduler previous 'superseded))
     (enqueue! scheduler snapshot 'resyntax parent-completion))
   (void))
 
 (define (settle! scheduler attempt outcome)
   (unless (eq? 'terminal (Analysis-Attempt-state attempt))
-    (when (Analysis-Attempt-worker attempt)
-      (define worker (Analysis-Attempt-worker attempt))
+    (set-Analysis-Attempt-state! attempt 'terminal)
+    (when (registered? scheduler attempt)
+      (hash-remove! (Analysis-Scheduler-attempts scheduler) (attempt-key attempt)))
+    (resolve-completion! (Analysis-Attempt-completion attempt) outcome)))
+
+;; Revoke acceptance immediately; place capacity remains reserved until the
+;; bridge reports cleanup. Ordinary completion only settles the logical attempt.
+(define (cancel-attempt! scheduler attempt reason)
+  (unless (eq? 'terminal (Analysis-Attempt-state attempt))
+    (define worker (Analysis-Attempt-worker attempt))
+    (when worker
       (if (Place-Task? worker)
           (begin
             (set-Analysis-Scheduler-retiring!
               scheduler (cons attempt (Analysis-Scheduler-retiring scheduler)))
             (cancel-place-task! worker))
           (stop-supervised-worker! worker)))
-    (set-Analysis-Attempt-state! attempt 'terminal)
-    (when (registered? scheduler attempt)
-      (hash-remove! (Analysis-Scheduler-attempts scheduler) (attempt-key attempt)))
-    (resolve-completion! (Analysis-Attempt-completion attempt) outcome)))
+    (settle! scheduler attempt (Analysis-Outcome 'stopped reason))))
 
 (define (cancel-source-analysis! scheduler source [reason 'source-changed])
   (for ([kind (in-list '(analysis resyntax))])
     (define attempt
       (hash-ref (Analysis-Scheduler-attempts scheduler) (cons (source-id source) kind) #f))
-    (when attempt (settle! scheduler attempt (Analysis-Outcome 'stopped reason))))
+    (when attempt (cancel-attempt! scheduler attempt reason)))
   (set-Analysis-Scheduler-queue!
     scheduler (filter (lambda (attempt) (registered? scheduler attempt))
                       (Analysis-Scheduler-queue scheduler))))
@@ -131,7 +137,7 @@
 (define (stop-analysis-scheduler! scheduler)
   (set-Analysis-Scheduler-stopped?! scheduler #t)
   (for ([attempt (in-list (hash-values (Analysis-Scheduler-attempts scheduler)))])
-    (settle! scheduler attempt (Analysis-Outcome 'stopped 'shutdown)))
+    (cancel-attempt! scheduler attempt 'shutdown))
   (set-Analysis-Scheduler-queue! scheduler '())
   (when (Analysis-Scheduler-runner scheduler)
     (stop-place-runner! (Analysis-Scheduler-runner scheduler))))
@@ -147,10 +153,9 @@
            (for/sum ([attempt (in-hash-values (Analysis-Scheduler-attempts scheduler))]
                      #:when (eq? 'running (Analysis-Attempt-state attempt)))
              1)))
-      (when (and (pair? queue) (< running (Analysis-Scheduler-slots scheduler))
-                 (or (not (Analysis-Scheduler-runner scheduler))
-                     (eq? 'resyntax (Analysis-Attempt-kind (car queue)))
-                     (place-runner-available? (Analysis-Scheduler-runner scheduler))))
+      ;; Every occupied runner slot has a running or retiring attempt. Their
+      ;; shared bound therefore also guarantees capacity for an analysis launch.
+      (when (and (pair? queue) (< running (Analysis-Scheduler-slots scheduler)))
         (define attempt (car queue))
         (set-Analysis-Scheduler-queue! scheduler (cdr queue))
         (if (and (registered? scheduler attempt)
@@ -190,10 +195,8 @@
   (set-Analysis-Scheduler-retiring!
     scheduler (remq attempt (Analysis-Scheduler-retiring scheduler)))
   (when (and (registered? scheduler attempt) (eq? 'running (Analysis-Attempt-state attempt)))
-    ;; The bridge has released job resources before reporting completion.
-    ;; Successful settlement must not abort a reusable worker or reserve a
-    ;; second retirement slot for an already-finished assignment.
-    (set-Analysis-Attempt-worker! attempt #f)
+    ;; The bridge released job resources before reporting; settlement has no
+    ;; worker effect, so the reusable place can already serve another attempt.
     (define outcome
       (accept (Analysis-Attempt-snapshot attempt) (Analysis-Attempt-kind attempt)
               (Analysis-Attempt-completion attempt) (Analysis-Attempt-parent-completion attempt)

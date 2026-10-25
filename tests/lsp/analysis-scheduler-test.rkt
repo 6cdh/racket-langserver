@@ -6,6 +6,7 @@
            "../../common/source.rkt"
            "../../workspace/source-store.rkt"
            "../../lsp/analysis.rkt"
+           (submod "../../lsp/analysis.rkt" test-support)
            "../../lsp/source-controller/analysis-scheduler.rkt"
            "../../lsp/source-controller/completion-event.rkt")
 

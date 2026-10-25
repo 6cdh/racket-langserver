@@ -14,6 +14,7 @@
          "../../common/path-util.rkt"
          "../../common/settings.rkt"
          "../../lsp/analysis.rkt"
+         (submod "../../lsp/analysis.rkt" test-support)
          "../../lsp/source-controller.rkt"
          "../../workspace/source-store.rkt"
          "controller-support.rkt")

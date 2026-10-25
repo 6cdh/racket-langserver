@@ -12,6 +12,7 @@
          "../../doclib/doc.rkt"
          "../../doclib/hover.rkt"
          "../../lsp/analysis.rkt"
+         (submod "../../lsp/analysis.rkt" test-support)
          "../../lsp/lsp.rkt"
          "../../lsp/safedoc.rkt"
          "../../lsp/source-controller.rkt"

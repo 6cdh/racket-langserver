@@ -27,11 +27,11 @@
                           (length (custodian-managed-list service-custodian parent)))
        (match command
          ['wrong-id
-          (match-define (list generation job payload) reply)
-          (place-channel-put channel (list generation (add1 job) payload))]
+          (match-define (list job payload) reply)
+          (place-channel-put channel (list (add1 job) payload))]
          ['bad-snapshot
-          (match-define (list generation job _) reply)
-          (place-channel-put channel (list generation job (list 'result #t #hasheq())))]
+          (match-define (list job _) reply)
+          (place-channel-put channel (list job (list 'result #t #hasheq())))]
          [_ (place-channel-put channel reply)])
        (when (eq? command 'reply-and-die) (exit 0))
        (loop)])))

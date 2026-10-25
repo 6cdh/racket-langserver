@@ -1,7 +1,7 @@
 #lang racket/base
 
 ;; Check Syntax products, and the outcomes request threads wait for.
-;; `analyze-source` returns an `Analysis-Product`. The source controller
+;; `restore-analysis` returns an `Analysis-Product`. The source controller
 ;; keeps that product's trace. Request threads receive an `Analysis-Summary`
 ;; or an `Analysis-Outcome`. Lifetime and reuse are in `analysis-lifecycle.md`.
 (require json
@@ -12,13 +12,11 @@
          "../common/interfaces.rkt"
          "../doclib/doc.rkt"
          "../doclib/hover.rkt"
-         "../doclib/check-syntax.rkt"
          "../doclib/doc-trace.rkt"
          "../doclib/internal-types.rkt"
          "../workspace/source-store.rkt")
 
-(provide analyze-source
-         restore-analysis
+(provide restore-analysis
          (struct-out Analysis-Summary)
          (struct-out Analysis-Product)
          (struct-out Analysis-Outcome)
@@ -106,15 +104,17 @@
     [(list? value) (map freeze-json value)]
     [else value]))
 
-;; Run Check Syntax for `snapshot` on a private document. On success, install
-;; the trace on that document before copying definition and hover facts.
-;; Those extractors read the document after that installation.
-(define (analyze-source snapshot)
-  (define doc (make-source-doc (Source-Snapshot-source snapshot) (Source-Snapshot-text snapshot)))
-  (define check-syntax-result (doc-check-syntax doc))
-  (define trace (CSResult-trace check-syntax-result))
-  (define succeeded? (CSResult-succeed? check-syntax-result))
-  (finalize-analysis doc trace succeeded?))
+;; Direct collection remains a test reference and ordinary-thread benchmark
+;; baseline. Production Check Syntax runs only in the place pool.
+(module+ test-support
+  (require "../doclib/check-syntax.rkt")
+  (provide analyze-source)
+
+  (define (analyze-source snapshot)
+    (define doc (make-source-doc (Source-Snapshot-source snapshot) (Source-Snapshot-text snapshot)))
+    (define check-syntax-result (doc-check-syntax doc))
+    (finalize-analysis doc (CSResult-trace check-syntax-result)
+                       (CSResult-succeed? check-syntax-result))))
 
 ;; Production receiving boundary. The submitted snapshot supplies source identity
 ;; and text; the completed worker trace supplies facts, including error results.

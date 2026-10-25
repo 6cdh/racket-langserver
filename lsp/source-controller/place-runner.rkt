@@ -34,20 +34,19 @@
 (define current-analysis-restorer (make-parameter restore-analysis))
 (module+ test-support (provide current-place-factory current-analysis-restorer))
 
-;; One physical place. id is its creating job's ID and stays fixed while later
-;; jobs advance Place-Runner's counter. A replacement records its own creating
-;; job's ID, so a reply from a retired generation cannot match the replacement.
+;; One physical place and its resource boundary, retained across job assignments.
+;; Reply identity belongs to the unique job ID, not to this resource record.
 ;;
 ;; custodian: Owns the place and stdout sink, including interrupted startup
 ;;   before the place handle is stored.
 ;; worker: #f until startup returns its place handle.
-(struct Generation (id custodian [worker #:mutable]))
+(struct Generation (custodian [worker #:mutable]))
 (struct Place-Task (cancel))
 ;; Each slot stays reserved through restoration or observed retirement, so both
 ;; physical places and parent-side work remain bounded by the configured capacity.
 (struct Worker-Slot ([generation #:mutable] [task #:mutable]))
 ;; owner-custodian owns both places and their cleanup bridges.
-;; serial is the increasing job counter; new generations use their first job ID.
+;; serial allocates job IDs across all slots and replacements in this runner.
 (struct Place-Runner (lock owner-custodian slots [serial #:mutable] [stopped? #:mutable]))
 
 ;; (->* () (#:slots exact-positive-integer?) Place-Runner?)
@@ -130,15 +129,15 @@
     (set-Generation-worker! generation worker))
   (define worker (Generation-worker generation))
   (place-channel-put worker
-                     (list (Generation-id generation) job (Source-Snapshot-uri snapshot)
+                     (list job (Source-Snapshot-uri snapshot)
                            (Source-Snapshot-text snapshot) (current-directory)))
   (match (receive-reply worker)
-    [(list (== (Generation-id generation)) (== job) (list 'result (? boolean? succeeded?) data))
+    [(list (== job) (list 'result (? boolean? succeeded?) data))
      ;; Job resources are gone. Restoration failure or cancellation still
      ;; reuses this place.
      (set-box! place-reusable? #t)
      ((current-analysis-restorer) snapshot succeeded? data)]
-    [(list (== (Generation-id generation)) (== job) (list 'failure (? string? detail)))
+    [(list (== job) (list 'failure (? string? detail)))
      ;; Cleanup ran, but the exception may have touched place-wide state outside
      ;; the job custodian. Fail the attempt and retire this place.
      (Analysis-Outcome 'failed detail)]
@@ -168,8 +167,7 @@
                      (sync/timeout 0 (place-dead-evt (Generation-worker previous)))))
               (when (or (not previous) dead?)
                 (set-Worker-Slot-generation!
-                  slot (Generation job
-                                   (make-custodian (Place-Runner-owner-custodian runner)) #f)))
+                  slot (Generation (make-custodian (Place-Runner-owner-custodian runner)) #f)))
               (set-Worker-Slot-task! slot task)
               (values slot (Worker-Slot-generation slot) (and dead? previous) job))))
   (runner-thread
