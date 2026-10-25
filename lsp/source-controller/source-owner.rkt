@@ -94,13 +94,17 @@
                                 #:analyze [analyze #f]
                                 #:analysis-slots [slots 4]
                                 #:analysis-timeout [analysis-timeout 90]
+                                ;; Wraps Check Syntax place creation. Stdio `main-loop` supplies
+                                ;; a reader-pausing guard; the default calls `thunk` unchanged.
+                                #:place-start-guard [place-start-guard (lambda (thunk) (thunk))]
                                 #:closed-analysis-limit [closed-analysis-limit 64]
                                 #:resyntax [resyntax (and (resyntax-available?) run-resyntax/in-place)])
   (define events (make-async-channel))
   (Source-Controller (make-source-store) events (make-semaphore 0)
                      (make-disk-reader events #:read read #:timeout read-timeout)
                      (make-analysis-scheduler events #:analyze analyze #:resyntax resyntax
-                                              #:slots slots #:timeout analysis-timeout)
+                                              #:slots slots #:timeout analysis-timeout
+                                              #:place-start-guard place-start-guard)
                      (make-closed-analysis-cache closed-analysis-limit)
                      (make-analysis-publisher workspace)))
 

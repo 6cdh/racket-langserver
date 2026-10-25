@@ -3,6 +3,7 @@
 ;; Session-owned reusable places, with no pending queue. The scheduler
 ;; reserves a slot before launch. A bridge supervises startup through restoration,
 ;; and retains the reservation until cancelled places have terminated.
+;; A session may wrap native place creation with `place-start-guard`.
 (require racket/async-channel
          racket/match
          racket/place
@@ -17,19 +18,22 @@
 
 (define-runtime-path worker-path "../analysis-place.rkt")
 
-(define (spawn-worker)
+(define (spawn-worker place-start-guard)
   ;; The file-stream stdout sink and closed stdin pipe need no pump threads.
   ;; Supplied stdout/stderr ports make both returned port values #f. The parent
   ;; stderr port may still need a pump, which place-wait joins at retirement.
   (define sink
     (open-output-file (if (eq? (system-type) 'windows) "NUL" "/dev/null") #:exists 'append))
   (define-values (worker input _stdout _stderr)
-    (dynamic-place* worker-path 'run #:out sink #:err (current-error-port)))
+    (place-start-guard
+      (lambda () (dynamic-place* worker-path 'run #:out sink #:err (current-error-port)))))
   (close-output-port input)
   worker)
 
 ;; Test factories still create real places. They can establish startup barriers
 ;; or substitute a wire peer without transporting an analysis closure.
+;; The runner passes its `place-start-guard`. Apply it around native creation
+;; when the test is exercising that path.
 (define current-place-factory (make-parameter spawn-worker))
 (define current-analysis-restorer (make-parameter restore-analysis))
 (module+ test-support (provide current-place-factory current-analysis-restorer))
@@ -45,15 +49,21 @@
 ;; Each slot stays reserved through restoration or observed retirement, so both
 ;; physical places and parent-side work remain bounded by the configured capacity.
 (struct Worker-Slot ([generation #:mutable] [task #:mutable]))
-;; owner-custodian owns both places and their cleanup bridges.
-;; serial allocates job IDs across all slots and replacements in this runner.
-(struct Place-Runner (lock owner-custodian slots [serial #:mutable] [stopped? #:mutable]))
+;; Session place pool. `lock` serializes slot assignment and retirement.
+;;
+;; owner-custodian: Owns places and their cleanup bridges, so disposing the
+;;   consumer's custodian cannot interrupt retirement.
+;; place-start-guard: Wraps only `dynamic-place*`. Must preserve multiple values.
+;; serial: Job IDs across all slots and replacements in this runner.
+(struct Place-Runner (lock owner-custodian place-start-guard slots
+                           [serial #:mutable] [stopped? #:mutable]))
 
-;; (->* () (#:slots exact-positive-integer?) Place-Runner?)
-(define (make-place-runner #:slots [slots 1])
+;; (->* () (#:slots exact-positive-integer? #:place-start-guard (-> (-> any) any)) Place-Runner?)
+(define (make-place-runner #:slots [slots 1]
+                           #:place-start-guard [place-start-guard (lambda (thunk) (thunk))])
   (unless (exact-positive-integer? slots)
     (raise-argument-error 'make-place-runner "exact-positive-integer?" slots))
-  (Place-Runner (make-semaphore 1) (current-custodian)
+  (Place-Runner (make-semaphore 1) (current-custodian) place-start-guard
                 (for/list ([_ (in-range slots)]) (Worker-Slot #f #f)) 0 #f))
 
 (define (locked runner proc)
@@ -121,11 +131,11 @@
                       (or (sync/timeout 0 worker)
                           (error 'place-runner "worker exited"))))))
 
-(define (execute-job generation job snapshot place-reusable?)
+(define (execute-job runner generation job snapshot place-reusable?)
   (unless (Generation-worker generation)
     (define worker
       (parameterize ([current-custodian (Generation-custodian generation)])
-        ((current-place-factory))))
+        ((current-place-factory) (Place-Runner-place-start-guard runner))))
     (set-Generation-worker! generation worker))
   (define worker (Generation-worker generation))
   (place-channel-put worker
@@ -189,7 +199,7 @@
             (lambda ()
               (async-channel-put results
                                  (with-handlers ([(lambda (_) #t) failure])
-                                   (execute-job generation job snapshot place-reusable?)))))))
+                                   (execute-job runner generation job snapshot place-reusable?)))))))
       (define result
         (sync results
               (handle-evt (semaphore-peek-evt (Place-Task-cancel task))

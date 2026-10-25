@@ -55,8 +55,11 @@
 (struct Analysis-Completed (attempt result))
 
 (define (make-analysis-scheduler events #:analyze [analyze #f] #:resyntax resyntax
-                                 #:timeout [timeout 90] #:slots [slots 4])
-  (Analysis-Scheduler events analyze (and (not analyze) (make-place-runner #:slots slots))
+                                 #:timeout [timeout 90] #:slots [slots 4]
+                                 #:place-start-guard [place-start-guard (lambda (thunk) (thunk))])
+  (Analysis-Scheduler events analyze
+                      (and (not analyze)
+                           (make-place-runner #:slots slots #:place-start-guard place-start-guard))
                       resyntax timeout slots (make-hash) '() '() #f))
 
 (define (attempt-key attempt)

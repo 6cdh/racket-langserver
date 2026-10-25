@@ -11,6 +11,7 @@
          racket/class
          racket/async-channel
          "common/interfaces.rkt"
+         "common/place-start-guard.rkt"
          "common/debug.rkt"
          "lsp/methods.rkt"
          "lsp/source-controller.rkt"
@@ -61,9 +62,14 @@
 ;; owns stdout. stdin EOF exits 1; a clean shutdown is the LSP `exit`
 ;; notification.
 (define (main-loop)
+  ;; Stdio stdin-reader pause around Check Syntax place creation.
+  ;; See `common/place-start-guard.rkt` and `lsp/analysis-lifecycle.md`.
+  (define guard (make-reader-place-start-guard (current-thread)))
+  (define controller (make-source-controller #:place-start-guard guard))
   (define resp-ch (make-async-channel))
   (define server
     (new server%
+      [source-controller controller]
       [response-channel resp-ch]
       [request-channel resp-ch]
       [notification-channel resp-ch]))

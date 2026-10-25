@@ -31,7 +31,7 @@
         void
         (lambda ()
           (parameterize ([current-place-factory
-                          (lambda ()
+                          (lambda (_guard)
                             (define worker (dynamic-place peer 'run-peer))
                             (define-values (control remote) (place-channel))
                             (place-channel-put worker remote)
@@ -141,14 +141,14 @@ RACKET
     (with-runner
       (lambda (runner events spawned)
         (define factory (current-place-factory))
-        (parameterize ([current-place-factory (lambda () (error 'startup "failed"))])
+        (parameterize ([current-place-factory (lambda (_guard) (error 'startup "failed"))])
           (start runner events))
         (check-eq? (Analysis-Outcome-state (await events)) 'failed)
         (define entered (make-async-channel))
         (define task
           (parameterize ([current-place-factory
-                          (lambda ()
-                            (define worker (factory))
+                          (lambda (guard)
+                            (define worker (factory guard))
                             (async-channel-put entered #t)
                             (sync never-evt)
                             worker)])
@@ -348,8 +348,8 @@ RACKET
         (define factory (current-place-factory))
         (define entered (make-async-channel))
         (parameterize ([current-place-factory
-                        (lambda ()
-                          (define worker (factory))
+                        (lambda (guard)
+                          (define worker (factory guard))
                           (async-channel-put entered #t)
                           (sync never-evt)
                           worker)])
@@ -370,6 +370,42 @@ RACKET
       #:slots 2)))
 
 (module+ test
+  (test-case "controllers retain their own startup guards across worker reuse"
+    (define custodian (make-custodian))
+    (define startups (make-async-channel))
+    (define caller (current-thread))
+    (parameterize ([current-custodian custodian])
+      (define controllers
+        (for/list ([name '(first second)])
+          (make-source-controller
+            #:analysis-slots 1 #:resyntax #f
+            #:place-start-guard
+            (lambda (thunk)
+              (async-channel-put startups (cons name (current-thread)))
+              (thunk)))))
+      (dynamic-wind
+        void
+        (lambda ()
+          (check-false (sync/timeout 0 startups))
+          (for ([controller (in-list controllers)] [name '(first second)])
+            (for ([assignment '(initial reused)])
+              (define source (uri->source (format "untitled:guard-~a.rkt" assignment)))
+              (define sd
+                (new-safedoc (source-uri source) "#lang racket/base\n(define value 1)\n" 0))
+              (source-controller-open! controller source sd)
+              (define completion (with-read-safedoc sd SafeDoc-analysis-completion))
+              (check-eq? (Analysis-Outcome-state (drive-controller controller completion 30))
+                         'succeeded)
+              (when (eq? assignment 'initial)
+                (match-define (cons observed-name startup-thread) (await startups))
+                (check-eq? observed-name name)
+                (check-not-eq? startup-thread caller))
+              (check-false (sync/timeout 0 startups)))))
+        (lambda ()
+          (for ([controller (in-list controllers)])
+            (source-controller-shutdown! controller))
+          (custodian-shutdown-all custodian)))))
+
   (test-case "pooled controller restores retained aliases and publishes before fresh completion"
     (with-runner
       (lambda (_runner _events spawned)
