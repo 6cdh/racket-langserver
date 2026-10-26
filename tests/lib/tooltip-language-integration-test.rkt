@@ -28,11 +28,6 @@
   (Hover-contents hover))
 
 (module+ test
-  (unless nanopass-available?
-    (displayln "Skipping Nanopass tooltip integration because nanopass is unavailable."))
-  (unless pie-available?
-    (displayln "Skipping Pie tooltip integration because pie is unavailable."))
-
   (test-case
     "Nanopass post-syntax properties produce mouse-over status"
     (when nanopass-available?

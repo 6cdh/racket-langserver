@@ -2,7 +2,8 @@
 
 ;; Cross-file definition requests use the production serial consumer. Gates
 ;; mark actual reads and target analysis starts; no sleep establishes ordering.
-(require "../../common/source.rkt"
+(require "../test-logging.rkt"
+         "../../common/source.rkt"
          drracket/check-syntax
          json
          rackunit
@@ -32,6 +33,8 @@
          "../../workspace/current.rkt"
          "../../workspace/source-store.rkt"
          "controller-support.rkt")
+
+(install-test-log-capture!)
 
 (define saved "#lang racket/base\n(provide shared)\n(define shared 1)\n")
 (define unsaved "#lang racket/base\n(provide shared)\n\n;; Unsaved\n(define shared 2)\n")

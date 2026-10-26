@@ -1,6 +1,7 @@
 #lang racket/base
 
-(require "../../common/source.rkt"
+(require "../test-logging.rkt"
+         "../../common/source.rkt"
          rackunit
          "../../doclib/doc-trace.rkt"
          "../../doclib/editor.rkt"
@@ -12,6 +13,8 @@
          racket/class
          racket/logging
          racket/string)
+
+(install-test-log-capture!)
 
 (define add-mouse-over-status
   (generic syncheck-annotations<%>

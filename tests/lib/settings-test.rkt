@@ -3,6 +3,7 @@
 (require json
          rackunit
          rackunit/text-ui
+         racket/port
          "../../common/interfaces.rkt"
          "../../common/settings.rkt"
          "../../lsp/workspace.rkt")
@@ -196,4 +197,5 @@
       (check-equal? (unbox requested) '()))))
 
 (module+ test
-  (run-tests settings-tests))
+  (parameterize ([current-output-port (open-output-nowhere)])
+    (void (run-tests settings-tests))))

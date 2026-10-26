@@ -27,8 +27,6 @@
 
 (module+ test
   (define has-fmt? (fmt-available?))
-  (unless has-fmt?
-    (displayln "Skipping fmt integration because fmt is unavailable."))
 
   (test-case
     "installed fmt formats through the document backend"

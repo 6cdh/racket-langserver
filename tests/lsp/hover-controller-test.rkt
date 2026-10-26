@@ -1,6 +1,7 @@
 #lang racket/base
 
-(require "../../common/source.rkt"
+(require "../test-logging.rkt"
+         "../../common/source.rkt"
          json
          rackunit
          racket/async-channel
@@ -19,6 +20,8 @@
          "../../workspace/source-store.rkt"
          "controller-support.rkt"
          (submod "definition-controller-test.rkt" test-support))
+
+(install-test-log-capture!)
 
 (define (request session id a [method "textDocument/hover"] [pos (Pos 3 7)])
   (request! session id method a (hasheq 'position (->jsexpr pos))))

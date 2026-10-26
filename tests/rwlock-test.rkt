@@ -22,10 +22,11 @@
     (define t
       (thread
         (λ ()
-          (call-with-write-lock rwlock
-            (λ ()
-              (semaphore-post entered)
-              (semaphore-wait done))))))
+          (with-handlers ([exn:break? void])
+            (call-with-write-lock rwlock
+              (λ ()
+                (semaphore-post entered)
+                (semaphore-wait done)))))))
 
     (check-not-false (sync/timeout 1.0 entered))
     (break-thread t)
@@ -43,10 +44,11 @@
     (define t
       (thread
         (λ ()
-          (call-with-read-lock rwlock
-            (λ ()
-              (semaphore-post entered)
-              (sync never-evt))))))
+          (with-handlers ([exn:break? void])
+            (call-with-read-lock rwlock
+              (λ ()
+                (semaphore-post entered)
+                (sync never-evt)))))))
 
     (check-not-false (sync/timeout 1.0 entered))
     (break-thread t)

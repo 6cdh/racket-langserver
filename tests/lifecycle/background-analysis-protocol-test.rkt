@@ -198,6 +198,5 @@
             ;; queued after the last response. The reader is the only log writer.
             (check-eq? (sync/timeout 5 frame-reader) frame-reader)
             (check-false frame-failure)
-            (check-false (hash-ref diagnostics b-uri #f))
-            (printf "Transport: unchanged target +1 expansion; each changed snapshot +1; cancellation and independent queries precede gate release.\n"))))
+            (check-false (hash-ref diagnostics b-uri #f)))))
       (lambda () (delete-directory/files root)))))

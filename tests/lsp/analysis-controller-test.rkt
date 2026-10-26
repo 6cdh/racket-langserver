@@ -1,6 +1,7 @@
 #lang racket/base
 
-(require "../../lsp/analysis-place-protocol.rkt"
+(require "../test-logging.rkt"
+         "../../lsp/analysis-place-protocol.rkt"
          (only-in "../fixtures/analysis-place-peer.rkt" Peer-Reply)
          "../../common/source.rkt"
          rackunit
@@ -32,6 +33,8 @@
          (only-in "../../lsp/source-controller/analysis-scheduler.rkt" Analysis-Completed?)
          "controller-support.rkt"
          (submod "../../lsp/source-controller/place-runner.rkt" test-support))
+
+(install-test-log-capture!)
 
 (define-runtime-path shared-peer "../fixtures/analysis-place-peer.rkt")
 

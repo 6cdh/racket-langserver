@@ -9,9 +9,6 @@
 
   (define has-resyntax? (doc-resyntax-available?))
 
-  (unless has-resyntax?
-    (displayln "Skipping tests/resyntax/resyntax-test.rkt because resyntax is unavailable."))
-
   (define nested-or-code
     "#lang racket\n(or 1 (or 2 3))")
 
