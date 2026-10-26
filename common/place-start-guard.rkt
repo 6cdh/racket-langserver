@@ -1,6 +1,6 @@
 #lang racket/base
 
-;; Pause the LSP stdin reader while this process creates a Check Syntax place.
+;; Pause the LSP stdin reader while this process creates a worker place.
 ;; Workaround for a Racket CS hang when place creation overlaps input
 ;; readiness. `main-loop` installs it; the session contract is in
 ;; `lsp/analysis-lifecycle.md`.
@@ -22,9 +22,9 @@
 (define (make-reader-place-start-guard reader)
   (define reader-custodian (current-custodian))
   (lambda (thunk)
-    ;; Atomic: no other Racket thread can cancel this startup while the reader
-    ;; is suspended. `dynamic-wind` still resumes the reader if `thunk` raises.
-    ;; A reader that is not running is left unchanged.
+    ;; Atomic: no other Racket thread can interrupt this create call while the
+    ;; reader is suspended. `dynamic-wind` still resumes the reader if `thunk`
+    ;; raises. A reader that is not running is left unchanged.
     (call-as-atomic
       (lambda ()
         (define running? (thread-running? reader))

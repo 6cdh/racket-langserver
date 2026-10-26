@@ -2,8 +2,23 @@
 
 ;; A real place with a test-controlled protocol. Assignment, preparation, and
 ;; cancellation receipts are barriers; tests decide when cleanup is acknowledged.
-(require racket/match racket/place "../../lsp/analysis-place.rkt")
-(provide run-peer run-unready-peer)
+(require "../../lsp/analysis-place-protocol.rkt"
+         racket/contract racket/match racket/place "../../lsp/analysis-place.rkt")
+(provide run-peer run-unready-peer
+         (struct-out Peer-Preparing) (struct-out Peer-Reply))
+
+;; Control-channel receipts, not worker wire messages.
+(struct Peer-Preparing (kind) #:prefab)
+
+(struct Peer-Reply (outcome) #:prefab)
+
+(struct/contract Peer-Wire
+  ([message any/c])
+  #:transparent)
+
+(struct/contract Peer-Command
+  ([message (or/c symbol? Peer-Reply?)])
+  #:transparent)
 
 (define (run-peer channel)
   (define control (place-channel-get channel))
@@ -12,51 +27,52 @@
   (define pending #f)
   (define manual-prepare? #f)
   (let loop ()
-    (match (sync (handle-evt channel (lambda (v) (list 'wire v)))
-                 (handle-evt control (lambda (v) (list 'command v))))
-      [(list 'wire (list 'prepare kind))
-       (place-channel-put local (list 'prepare kind))
+    (match (sync (handle-evt channel Peer-Wire)
+                 (handle-evt control Peer-Command))
+      [(Peer-Wire (Place-Prepare kind))
+       (place-channel-put local (Place-Prepare kind))
        (define ready (place-channel-get local))
        (if manual-prepare?
-           (begin (set! pending ready) (place-channel-put control (list 'preparing kind)))
+           (begin (set! pending ready) (place-channel-put control (Peer-Preparing kind)))
            (place-channel-put channel ready))]
-      [(list 'wire (and request (list 'start _ _ _ _ _)))
+      [(Peer-Wire (and request (struct* Place-Start ())))
        (set! pending request)
        (place-channel-put control request)]
-      [(list 'wire (and request (list 'cancel _)))
+      [(Peer-Wire (and request (Place-Cancel _)))
        (place-channel-put control request)]
-      [(list 'command 'manual-prepare) (set! manual-prepare? #t)
+      [(Peer-Command 'manual-prepare) (set! manual-prepare? #t)
        (place-channel-put control 'configured)]
-      [(list 'command 'ready) (place-channel-put channel pending)]
-      [(list 'command 'cancelled)
-       (match-define (list 'start id _ _ _ _) pending)
-       (place-channel-put channel (list 'terminal id '(cancelled)))]
-      [(list 'command 'finish)
-       (match-define (list 'start id kind _ _ _) pending)
+      [(Peer-Command 'ready) (place-channel-put channel pending)]
+      [(Peer-Command 'cancelled)
+       (match-define (struct* Place-Start ([id id])) pending)
+       (place-channel-put channel (Place-Terminal id (Place-Cancelled)))]
+      [(Peer-Command 'finish)
+       (match-define (struct* Place-Start ([id id] [kind kind])) pending)
        (place-channel-put channel
-                          (list 'terminal id
-                                (if (eq? kind 'resyntax)
-                                    '(result ()) '(result #t #hasheq()))))]
-      [(list 'command (list 'reply payload))
-       (match-define (list 'start id _ _ _ _) pending)
-       (place-channel-put channel (list 'terminal id payload))]
-      [(list 'command 'wrong-id)
-       (match-define (list 'start id _ _ _ _) pending)
-       (place-channel-put channel (list 'terminal (add1 id) '(cancelled)))]
-      [(list 'command 'bad-id)
-       (place-channel-put channel '(terminal invalid-id (cancelled)))]
-      [(list 'command 'wrong-kind)
-       (match-define (list 'start id _ _ _ _) pending)
-       (place-channel-put channel (list 'terminal id '(result ())))]
-      [(list 'command 'failure)
-       (match-define (list 'start id _ _ _ _) pending)
-       (place-channel-put channel (list 'terminal id '(failure "job failure")))]
-      [(list 'command 'run)
+                          (Place-Terminal id
+                                          (if (eq? kind 'resyntax)
+                                              (Place-Resyntax-Result '())
+                                              (Place-Check-Syntax-Result #t #hasheq()))))]
+      [(Peer-Command (Peer-Reply payload))
+       (match-define (struct* Place-Start ([id id])) pending)
+       (place-channel-put channel (Place-Terminal id payload))]
+      [(Peer-Command 'wrong-id)
+       (match-define (struct* Place-Start ([id id])) pending)
+       (place-channel-put channel (Place-Terminal (add1 id) (Place-Cancelled)))]
+      [(Peer-Command 'bad-id)
+       (place-channel-put channel (Place-Terminal 'invalid-id (Place-Cancelled)))]
+      [(Peer-Command 'wrong-kind)
+       (match-define (struct* Place-Start ([id id])) pending)
+       (place-channel-put channel (Place-Terminal id (Place-Resyntax-Result '())))]
+      [(Peer-Command 'failure)
+       (match-define (struct* Place-Start ([id id])) pending)
+       (place-channel-put channel (Place-Terminal id (Place-Failure "job failure")))]
+      [(Peer-Command 'run)
        (place-channel-put local pending)
        (place-channel-put channel (place-channel-get local))
        (place-channel-put control 'cleaned)]
-      [(list 'command 'die) (exit 1)]
-      [(list 'command 'hang) (sync never-evt)])
+      [(Peer-Command 'die) (exit 1)]
+      [(Peer-Command 'hang) (sync never-evt)])
     (loop)))
 
 ;; This peer exposes initialization receipt without loading an analysis stack.
@@ -65,5 +81,5 @@
   (define control (place-channel-get channel))
   (let loop ()
     (match (place-channel-get channel)
-      [(list 'prepare kind) (place-channel-put control (list 'preparing kind))])
+      [(Place-Prepare kind) (place-channel-put control (Peer-Preparing kind))])
     (loop)))

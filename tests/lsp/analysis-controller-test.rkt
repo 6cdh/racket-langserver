@@ -1,6 +1,8 @@
 #lang racket/base
 
-(require "../../common/source.rkt"
+(require "../../lsp/analysis-place-protocol.rkt"
+         (only-in "../fixtures/analysis-place-peer.rkt" Peer-Reply)
+         "../../common/source.rkt"
          rackunit
          racket/async-channel
          racket/class
@@ -713,7 +715,7 @@
               (barrier session)
               (define accepted (await (acquire session path)))
               (match-define (cons old control) (await created))
-              (check-match (await control) (list 'start _ 'resyntax _ _ _))
+              (check-match (await control) (struct* Place-Start ([kind 'resyntax])))
               (place-channel-put control 'die)
               (let loop ()
                 (define log (await logs))
@@ -727,9 +729,10 @@
               (await (acquire session path))
               (match-define (cons fresh fresh-control) (await created))
               (check-not-eq? fresh old)
-              (check-match (await fresh-control) (list 'start _ 'resyntax _ _ _))
+              (check-match (await fresh-control) (struct* Place-Start ([kind 'resyntax])))
               (define finding (Resyntax-Result 0 5 "accepted" 'test "new"))
-              (place-channel-put fresh-control (list 'reply (list 'result (list (->jsexpr finding)))))
+              (place-channel-put fresh-control
+                                 (Peer-Reply (Place-Resyntax-Result (list (->jsexpr finding)))))
               (await (Session-notifications session))
               (define publication (hash-ref (await (Session-notifications session)) 'params))
               (check-not-false

@@ -1,10 +1,13 @@
 #lang racket/base
 
-;; Persistent worker for Check Syntax and Resyntax. The control thread receives
-;; commands, loads each adapter under a worker-owned lifetime, and runs every
-;; job on a fresh thread and child custodian. It sends a terminal reply only
-;; after that job's cleanup. Cross-file rules are in analysis-lifecycle.md.
-(require racket/async-channel
+;; Persistent worker for Check Syntax and Resyntax. Production gives each kind
+;; its own pool, but one place can still load both adapters. The control thread
+;; receives commands, loads each adapter under a worker-owned lifetime, and
+;; runs every job on a fresh thread and child custodian. It sends a terminal
+;; reply only after that job's cleanup. Cross-file rules are in
+;; analysis-lifecycle.md.
+(require "analysis-place-protocol.rkt"
+         racket/async-channel
          racket/class
          racket/contract
          racket/match
@@ -13,6 +16,23 @@
          racket/runtime-path)
 
 (provide run)
+
+(struct/contract Worker-Command
+  ([message (or/c Place-Prepare? Place-Start? Place-Cancel?)])
+  #:transparent)
+
+(struct/contract Loaded-Adapter
+  ([adapter (-> string? string?
+                (or/c Place-Check-Syntax-Result? Place-Resyntax-Result?))])
+  #:transparent)
+
+(struct/contract Stack-Initialized
+  ([outcome (or/c Loaded-Adapter? Place-Failure?)])
+  #:transparent)
+
+(struct/contract Job-Finished
+  ([outcome (or/c Place-Failure? Place-Check-Syntax-Result? Place-Resyntax-Result?)])
+  #:transparent)
 
 (define-runtime-path doc-path "../doclib/doc.rkt")
 (define-runtime-path syntax-path "../doclib/check-syntax.rkt")
@@ -39,20 +59,19 @@
      (define succeeded? (dynamic-require syntax-path 'CSResult-succeed?))
      (lambda (uri text)
        (define result (check (make-doc uri text)))
-       (list 'result (succeeded? result) (send (trace result) serialize)))]
+       (Place-Check-Syntax-Result (succeeded? result) (send (trace result) serialize)))]
     [(resyntax)
      (define analyze (dynamic-require resyntax-path 'run-resyntax))
      (define ->jsexpr (dynamic-require json-path '->jsexpr))
-     (lambda (uri text) (list 'result (->jsexpr (analyze text uri))))]
+     (lambda (uri text) (Place-Resyntax-Result (->jsexpr (analyze text uri))))]
     [else (error 'analysis-place "unknown analysis kind: ~e" kind)]))
 
 ;; One initializing stack or one job. The producer always enqueues before
-;; dying. On a death event the controller polls this queue first, because both
-;; events can become ready at the same time.
+;; dying. On a death event the control thread polls this queue first, because
+;; both events can become ready at the same time.
 ;;
 ;; id: The kind while initializing; the assignment ID while a job is active.
-;; outcomes: Tagged initialization or job results (`'adapter`, `'failure`, or a
-;;   transferable job reply).
+;; outcomes: Loaded-Adapter, Place-Failure, or a transferable job result.
 (struct/contract Work
   ([id (or/c 'check-syntax 'resyntax exact-positive-integer?)]
    [custodian custodian?]
@@ -63,7 +82,8 @@
 ;; Retain the initialization custodian along with its adapter for the entire
 ;; worker lifetime, including any library helper resources it manages.
 (struct/contract Stack
-  ([adapter (-> string? string? list?)]
+  ([adapter (-> string? string?
+                (or/c Place-Check-Syntax-Result? Place-Resyntax-Result?))]
    [custodian custodian?])
   #:transparent)
 
@@ -77,18 +97,18 @@
           (async-channel-put
             outcomes
             (with-handlers ([(lambda (_) #t)
-                             (lambda (reason) (list 'failure (failure-detail reason)))])
+                             (lambda (reason) (Place-Failure (failure-detail reason)))])
               (thunk)))))))
   (Work id custodian worker outcomes))
 
-(define (work-event work tag)
+(define (work-event work wrap)
   (if work
       (choice-evt
-        (handle-evt (Work-outcomes work) (lambda (value) (list tag value)))
+        (handle-evt (Work-outcomes work) wrap)
         (handle-evt (thread-dead-evt (Work-thread work))
                     (lambda (_)
-                      (list tag (or (async-channel-try-get (Work-outcomes work))
-                                    '(failure "analysis thread died without an outcome"))))))
+                      (wrap (or (async-channel-try-get (Work-outcomes work))
+                                (Place-Failure "analysis thread died without an outcome"))))))
       never-evt))
 
 (define (run channel)
@@ -103,36 +123,37 @@
         (set! active #f)
         ;; Preserve reader/macro stderr before reuse or place retirement.
         (flush-output (current-error-port))
-        (place-channel-put channel (list 'terminal id reply))
+        (place-channel-put channel (Place-Terminal id reply))
         (loop initializing #f))
       (define event
-        (sync (handle-evt channel (lambda (command) (list 'command command)))
-              (work-event initializing 'initialized)
-              (work-event active 'finished)))
-      ;; Protocol errors escape this controller and end the place. Only the
+        (sync (handle-evt channel Worker-Command)
+              (work-event initializing Stack-Initialized)
+              (work-event active Job-Finished)))
+      ;; Protocol errors escape this control thread and end the place. Only the
       ;; job-thread execution boundary translates arbitrary failures to replies.
       (match event
-        [(list 'command (list 'prepare kind))
+        [(Worker-Command (Place-Prepare kind))
          (cond
            [(hash-has-key? adapters kind)
-            (place-channel-put channel (list 'ready kind))
+            (place-channel-put channel (Place-Ready kind))
             (loop initializing active)]
            [initializing (error 'analysis-place "overlapping initialization")]
            [else
-            ;; Initialization has its own persistent lifetime. In particular,
-            ;; it is never a descendant of a cancellable job custodian.
-            (loop (spawn-work kind (lambda () (list 'adapter (load-adapter kind)))) active)])]
-        [(list 'initialized (list 'adapter adapter))
+            ;; Initialization has its own persistent lifetime, never a descendant
+            ;; of a cancellable job custodian.
+            (loop (spawn-work kind (lambda () (Loaded-Adapter (load-adapter kind)))) active)])]
+        [(Stack-Initialized (Loaded-Adapter adapter))
          (define kind (Work-id initializing))
          ;; Keep initialization's custodian alive: libraries may own helpers.
          (hash-set! adapters kind (Stack adapter (Work-custodian initializing)))
-         (place-channel-put channel (list 'ready kind))
+         (place-channel-put channel (Place-Ready kind))
          (loop #f active)]
-        [(list 'initialized (list 'failure detail))
-         ;; Send the failure, then return to end the controller and place: a
-         ;; partially initialized stack must not remain alive for later jobs.
-         (place-channel-put channel (list 'init-failure detail))]
-        [(list 'command (list 'start id kind uri text directory))
+        [(Stack-Initialized (Place-Failure detail))
+         ;; Send the failure, then return to end the control thread and place:
+         ;; a partially initialized stack must not remain alive for later jobs.
+         (place-channel-put channel (Place-Init-Failure detail))]
+        [(Worker-Command (struct* Place-Start ([id id] [kind kind] [uri uri]
+                                               [text text] [directory directory])))
          (when active (error 'analysis-place "worker already has an active job"))
          (define adapter (Stack-adapter (hash-ref adapters kind)))
          (loop initializing
@@ -144,8 +165,8 @@
                      (unless (place-message-allowed? reply)
                        (error 'analysis-place "result is not transferable"))
                      reply))))]
-        [(list 'command (list 'cancel id))
+        [(Worker-Command (Place-Cancel id))
          (if (and active (equal? id (Work-id active)))
-             (terminate-job! id '(cancelled))
+             (terminate-job! id (Place-Cancelled))
              (loop initializing active))]
-        [(list 'finished reply) (terminate-job! (Work-id active) reply)]))))
+        [(Job-Finished reply) (terminate-job! (Work-id active) reply)]))))

@@ -88,13 +88,14 @@
 (define (make-source-controller #:workspace [workspace current-workspace]
                                 #:read [read read-source-text]
                                 #:read-timeout [read-timeout 3]
-                                ;; `#f` selects production Check Syntax through the shared
-                                ;; pool; a procedure injects a pool task under its task custodian.
+                                ;; `#f` uses production Check Syntax. A procedure is a
+                                ;; local injected task in that pool, under the task custodian.
                                 #:analyze [analyze #f]
+                                ;; Check Syntax slot count. Resyntax always has one slot.
                                 #:analysis-slots [slots 4]
                                 #:analysis-timeout [analysis-timeout 90]
-                                ;; Wraps shared-pool place creation. Stdio `main-loop` supplies
-                                ;; a reader-pausing guard; the default calls `thunk` unchanged.
+                                ;; Wraps place creation in both pools. Stdio pauses the
+                                ;; stdin reader; the default calls `thunk` unchanged.
                                 #:place-start-guard [place-start-guard (lambda (thunk) (thunk))]
                                 #:closed-analysis-limit [closed-analysis-limit 64]
                                 #:resyntax [resyntax (and (resyntax-available?) 'place)])

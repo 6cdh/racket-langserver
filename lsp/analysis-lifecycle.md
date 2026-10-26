@@ -120,12 +120,12 @@ session; the request layer must use that same workspace.
 - `workspace/source-store.rkt`: source authority, revisions, and change signals
 - `source-controller/disk-reader.rkt`: ordered per-source disk reads and shared
   waiters
-- `source-controller/analysis-scheduler.rkt`: shared source attempts, acceptance,
-  and completion
-- `source-controller/place-runner.rkt`: shared FIFO, deadlines, slots,
+- `source-controller/analysis-scheduler.rkt`: source attempts, acceptance,
+  completion, and routing to a pool per kind
+- `source-controller/place-runner.rkt`: one pool's FIFO, deadlines, slots,
   restoration, and recovery
-- `analysis-place.rkt`: persistent control loop and per-job threads for both
-  task kinds
+- `analysis-place.rkt`: persistent control loop and per-job threads; one place
+  can load both task kinds
 - `source-controller/supervised-worker.rkt`: independent disk-read supervision
 - `source-controller/analysis-publisher.rkt`: installation, diagnostics, and
   Resyntax publication; buffer operations require the controller-held SafeDoc
@@ -165,19 +165,24 @@ message is rejected by the reader.
 
 ## Place execution
 
-Check Syntax and Resyntax share one session-owned pool. The manager is an
-ordinary thread. It owns the only FIFO, absolute deadlines, a fixed number of
-slots (`#:analysis-slots`, four by default), and recovery. The analysis
-scheduler (`source-controller/analysis-scheduler.rkt`) submits tasks, cancels
-their handles, and accepts outcomes. It does not know worker identities,
-availability, or retirement counts.
+Check Syntax and Resyntax have separate session-owned pools. Each pool has an
+ordinary manager thread that owns its FIFO, absolute deadlines, fixed slots,
+and recovery. `#:analysis-slots` sets Check Syntax capacity, four by default;
+Resyntax has one slot. A controller can have up to five places by default. The
+analysis scheduler (`source-controller/analysis-scheduler.rkt`) routes each kind
+to its pool, cancels task handles, and accepts outcomes. It does not know worker
+identities, availability, or retirement counts. A blocked Resyntax task cannot
+reserve Check Syntax capacity, and conversely.
 
 Each slot holds at most one place and stays reserved through native startup,
 library initialization, execution, transfer, parent restoration, and cleanup.
-With N slots, at most N tasks execute or restore and at most N places exist.
-A dead worker stays reserved through parent cleanup, then retires without
-becoming idle. Places start lazily. Idle places stay warm. Either task kind
-may be a worker's first assignment.
+With N Check Syntax slots, at most N Check Syntax tasks and one Resyntax task
+can execute or restore, with at most N + 1 places. A dead worker stays reserved
+through parent cleanup, then retires without becoming idle. Both pools start
+places only on submission; constructing a controller creates no places. The
+Resyntax pool stays empty until accepted, successful Check Syntax for an open
+buffer schedules enabled Resyntax. Idle places stay warm within their own pool.
+Shutdown stops both pools.
 
 `#:analyze #f` selects production Check Syntax. `analyze-source` remains in
 `analysis.rkt`'s `test-support` submodule for reference collection and the
@@ -209,7 +214,7 @@ Racket CS 9.3 can lose a scheduled-thread count when place creation overlaps
 input readiness. The runtime then undercounts runnable threads, so the
 stdin reader never runs and a stdio session hangs.
 
-`main-loop` wraps shared-pool `dynamic-place*` with
+`main-loop` wraps `dynamic-place*` in both pools with
 `make-reader-place-start-guard` on this process's stdin reader. The guard
 suspends that reader for the native create call and resumes it when creation
 returns, including when creation raises. Non-stdio controllers keep the
@@ -261,10 +266,10 @@ still follow the ordinary job-failure path.
 
 Cancellation acknowledgment waits one second. Native startup and the first
 library initialization share one 90-second watchdog, armed at dispatch and not
-renewed when the place is created. Initializing another task kind on an
-existing worker gets a new 90-second watchdog. These are operational defaults,
-not measured bounds. Repeated cancellation does not restart the startup
-watchdog or the cleanup-acknowledgment timer.
+renewed when the place is created. A second kind on an existing worker, which
+production pools do not send, gets a new 90-second watchdog. These are
+operational defaults, not measured bounds. Repeated cancellation does not
+restart the startup watchdog or the cleanup-acknowledgment timer.
 A stalled worker is killed and observed terminated before its slot becomes
 free. Replacement is lazy. Jobs are never retried automatically.
 
@@ -281,8 +286,10 @@ under the pool's owning session lifetime.
 
 ### Replies and reuse
 
-The wire carries preparation and readiness, start, cancellation, and terminal
-messages. Every job command and terminal reply carries a unique assignment ID.
+The wire uses the prefab structs in `analysis-place-protocol.rkt` for preparation
+and readiness, start, cancellation, and terminal messages. Check Syntax and Resyntax
+have separate result structs. Pool and worker event structs stay local to their
+threads. Every job command and terminal reply carries a unique assignment ID.
 The manager reads messages from the assigned physical worker and validates that
 ID, so an obsolete result or cancel cannot affect a later task.
 
@@ -371,13 +378,14 @@ stops work and clears retention.
 
 ## Capacity
 
-Keep four slots and lazy startup. Do not add prewarming, priority scheduling,
-or automatic retry. Normal cancellation preserves the executing place after
-job cleanup.
+Keep four Check Syntax slots, one Resyntax slot, and lazy startup. Do not add
+prewarming, priority scheduling, or automatic retry. Normal cancellation
+preserves the executing place after job cleanup.
 
-The [shared-pool measurements](../bench/shared-place-pool-results.md) record
-rapid-edit latency and worker-creation counts for this executor, including
-slower samples. They do not establish a general latency improvement. The
+The earlier [shared-pool measurements](../bench/shared-place-pool-results.md)
+record rapid-edit latency and worker-creation counts with a single shared
+pool, including slower samples. Those measurements do not evaluate the
+separate pools. They do not establish a general latency improvement. The
 archived [place-runner measurements](../bench/place-runner-results.md)
 compared one, two, and four slots with an ordinary-thread baseline. Those
 samples showed a warm heavy-batch benefit at four places, and higher first-use
@@ -393,6 +401,8 @@ worker messages own an isolated controller on the test thread and call the
 same owner operations. Assertions run on the test thread. Command failures
 are values only where a test explicitly exercises that production contract.
 
+- `tests/resyntax/separate-pools-test.rkt`: lazy place creation, independent
+  capacity, shutdown, and the Check Syntax success gate.
 - `tests/resyntax/place-runner-test.rkt`: pool transitions and fallback, using a
   controllable real place. Barriers are explicit receipts, not sleeps.
 - `tests/resyntax/shared-worker-test.rkt`: started real jobs, resource cleanup,

@@ -1,10 +1,12 @@
 #lang racket/base
 
 ;; Interrupted real Check Syntax and installed Resyntax must clean job
-;; resources and reuse the same place. An availability skip does not establish
-;; Resyntax integration.
+;; resources and reuse the same place. This drives one worker directly;
+;; production uses a separate pool per kind. An availability skip does not
+;; establish Resyntax integration.
 
-(require rackunit
+(require "../../lsp/analysis-place-protocol.rkt"
+         rackunit
          racket/file
          racket/format
          racket/match
@@ -14,6 +16,8 @@
          racket/tcp
          "../../doclib/external/resyntax.rkt")
 
+(struct Resources-Started (kind port) #:prefab)
+
 (define-runtime-path worker-path "../../lsp/analysis-place.rkt")
 
 (define (receive worker)
@@ -22,11 +26,12 @@
 ;; Source shared by the reader and expansion programs: announce that child
 ;; resources exist, then block until the job custodian shuts them down.
 (define (blocking-handshake-source port started-tag)
-  (~a "  (define owned (tcp-listen 0 4 #t \"127.0.0.1\"))\n"
+  (~a "  (struct Resources-Started (kind port) #:prefab)\n"
+      "  (define owned (tcp-listen 0 4 #t \"127.0.0.1\"))\n"
       "  (define-values (h p r rp) (tcp-addresses owned #t))\n"
       "  (define-values (i o) (tcp-connect \"127.0.0.1\" " port "))\n"
       "  (thread (lambda () (sync never-evt)))\n"
-      "  (write (list '" started-tag " p) o) (newline o) (flush-output o)\n"
+      "  (write (Resources-Started '" started-tag " p) o) (newline o) (flush-output o)\n"
       "  (sync never-evt)"))
 
 (module+ test
@@ -38,10 +43,10 @@
     (dynamic-wind
       void
       (lambda ()
-        (place-channel-put worker '(prepare check-syntax))
+        (place-channel-put worker (Place-Prepare 'check-syntax))
         ;; A stale cancel during first initialization must not own its lifetime.
-        (place-channel-put worker '(cancel obsolete))
-        (check-equal? (receive worker) '(ready check-syntax))
+        (place-channel-put worker (Place-Cancel 'obsolete))
+        (check-equal? (receive worker) (Place-Ready 'check-syntax))
         (define reader (build-path root "reader.rkt"))
         (call-with-output-file reader
           (lambda (out)
@@ -55,14 +60,14 @@
               out)))
         (define uri (~a "file://" (build-path root "source.rkt")))
         (place-channel-put worker
-                           (list 'start 1 'check-syntax uri
-                                 (~a "#reader (file " (~s (path->string reader)) ")\n") root))
+                           (Place-Start 1 'check-syntax uri
+                                        (~a "#reader (file " (~s (path->string reader)) ")\n") root))
         ;; This message is emitted inside read-syntax after child resources exist.
         (check-not-false (sync/timeout 60 listener))
         (define-values (reader-in reader-out) (tcp-accept listener))
-        (match-define (list 'reader-start owned-port) (read reader-in))
-        (place-channel-put worker '(cancel 1))
-        (check-equal? (receive worker) '(terminal 1 (cancelled)))
+        (match-define (Resources-Started 'reader-start owned-port) (read reader-in))
+        (place-channel-put worker (Place-Cancel 1))
+        (check-equal? (receive worker) (Place-Terminal 1 (Place-Cancelled)))
         (check-not-false (sync/timeout 5 reader-in))
         (check-true (eof-object? (read reader-in)))
         (check-exn exn:fail:network?
@@ -71,18 +76,18 @@
         (close-output-port reader-out)
         ;; A boundary exception must clean the job and preserve this exact place.
         (place-channel-put worker
-                           (list 'start 2 'check-syntax uri #f root))
-        (check-match (receive worker) (list 'terminal 2 (list 'failure (? string?))))
-        (place-channel-put worker '(cancel 1))
+                           (Place-Start 2 'check-syntax uri #f root))
+        (check-match (receive worker) (Place-Terminal 2 (Place-Failure (? string?))))
+        (place-channel-put worker (Place-Cancel 1))
         (place-channel-put worker
-                           (list 'start 3 'check-syntax uri
-                                 "#lang racket/base\n(define value 42)\n" root))
-        (check-match (receive worker) (list 'terminal 3 (list 'result #t _)))
-        (place-channel-put worker '(prepare resyntax))
-        (check-equal? (receive worker) '(ready resyntax))
+                           (Place-Start 3 'check-syntax uri
+                                        "#lang racket/base\n(define value 42)\n" root))
+        (check-match (receive worker) (Place-Terminal 3 (Place-Check-Syntax-Result #t _)))
+        (place-channel-put worker (Place-Prepare 'resyntax))
+        (check-equal? (receive worker) (Place-Ready 'resyntax))
         (place-channel-put worker
-                           (list 'start 4 'resyntax uri "#lang racket/base\n" root))
-        (check-match (receive worker) (list 'terminal 4 (list 'result (? list?))))
+                           (Place-Start 4 'resyntax uri "#lang racket/base\n" root))
+        (check-match (receive worker) (Place-Terminal 4 (Place-Resyntax-Result (? list?))))
         (when (resyntax-available?)
           ;; The message comes from real Resyntax expansion, after its child
           ;; resources exist. Cancellation must preserve the initialized stack.
@@ -92,39 +97,39 @@
                 "(begin-for-syntax\n"
                 (blocking-handshake-source port 'resyntax-start)
                 ")\n"))
-          (place-channel-put worker (list 'start 20 'resyntax uri blocking-source root))
+          (place-channel-put worker (Place-Start 20 'resyntax uri blocking-source root))
           (check-not-false (sync/timeout 60 listener))
           (define-values (in out) (tcp-accept listener))
-          (match-define (list 'resyntax-start child-port) (read in))
-          (place-channel-put worker '(cancel 20))
-          (check-equal? (receive worker) '(terminal 20 (cancelled)))
+          (match-define (Resources-Started 'resyntax-start child-port) (read in))
+          (place-channel-put worker (Place-Cancel 20))
+          (check-equal? (receive worker) (Place-Terminal 20 (Place-Cancelled)))
           (check-not-false (sync/timeout 5 in))
           (check-true (eof-object? (read in)))
           (check-exn exn:fail:network? (lambda () (tcp-connect "127.0.0.1" child-port)))
           (close-input-port in)
           (close-output-port out)
           (place-channel-put worker
-                             (list 'start 21 'resyntax uri
-                                   "#lang racket\n(or 1 (or 2 3))" root))
+                             (Place-Start 21 'resyntax uri
+                                          "#lang racket\n(or 1 (or 2 3))" root))
           (define result (receive worker))
-          (check-match result (list 'terminal 21 (list 'result (list _))))
-          (match-define (list 'terminal 21 (list 'result (list finding))) result)
+          (check-match result (Place-Terminal 21 (Place-Resyntax-Result (list _))))
+          (match-define (Place-Terminal 21 (Place-Resyntax-Result (list finding))) result)
           (check-equal? (hash-ref finding 'new-text) "(or 1 2 3)"))
         ;; Either completion or cancellation may win; each ID has one terminal.
         ;; The subsequent ready response also detects a duplicate terminal.
         (for ([id (in-range 5 9)])
           (place-channel-put worker
-                             (list 'start id 'check-syntax uri
-                                   "#lang racket/base\n" root))
-          (place-channel-put worker (list 'cancel id))
+                             (Place-Start id 'check-syntax uri
+                                          "#lang racket/base\n" root))
+          (place-channel-put worker (Place-Cancel id))
           (define terminal (receive worker))
           (check-true
             (match terminal
-              [(list 'terminal received-id (or (list 'result #t _) '(cancelled)))
+              [(Place-Terminal received-id (or (Place-Check-Syntax-Result #t _) (Place-Cancelled)))
                (equal? received-id id)]
               [_ #f]))
-          (place-channel-put worker '(prepare check-syntax))
-          (check-equal? (receive worker) '(ready check-syntax)))
+          (place-channel-put worker (Place-Prepare 'check-syntax))
+          (check-equal? (receive worker) (Place-Ready 'check-syntax)))
         (check-false (sync/timeout 0 (place-dead-evt worker))))
       (lambda ()
         (place-kill worker)

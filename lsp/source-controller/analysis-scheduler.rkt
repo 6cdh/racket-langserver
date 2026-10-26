@@ -1,11 +1,11 @@
 #lang racket/base
 
 ;; Source attempts and owner acceptance for Check Syntax and Resyntax.
-;; The shared pool owns FIFO admission and physical capacity. This module
-;; owns same-revision sharing, supersession, and acceptance-before-completion.
-;; This module's `settle!` removes a source attempt. The pool's `settle!` is
-;; logical task settlement and may notify before physical cleanup.
-;; Cross-file rules are in ../analysis-lifecycle.md.
+;; Each kind has its own lazy pool for FIFO admission and physical capacity.
+;; This module owns same-revision sharing, supersession, and
+;; acceptance-before-completion. `settle!` removes a source attempt.
+;; A pool's `settle-pool-task!` is logical task settlement and may notify
+;; before physical cleanup. Cross-file rules are in ../analysis-lifecycle.md.
 (require racket/async-channel
          racket/contract
          "../../common/source.rkt"
@@ -33,7 +33,7 @@
 ;; with physical capacity.
 ;;
 ;; parent-completion: Installed analysis that a Resyntax attempt must still match.
-;; completion: Shared event waiters join; resolved only after accept returns.
+;; completion: Waiters join this attempt's event; resolved when `settle!` runs.
 ;; deadline: Absolute milliseconds captured at enqueue, including FIFO wait.
 ;; task: Opaque pool handle for cancellation; not a worker identity.
 (struct/contract Analysis-Attempt
@@ -44,18 +44,22 @@
    [deadline real?]
    [(task #:mutable) (or/c #f Place-Task?)]))
 
-;; Source-attempt registry and pool handle. Does not own FIFO or slots.
+;; Source-attempt registry and per-kind pool handles. Does not own FIFO or slots.
 ;;
+;; events: Logical settlement envelopes for owner acceptance.
 ;; analyze: `#f` uses the production Check Syntax adapter; a procedure is a
-;;   local injected task.
+;;   local injected task in that pool.
+;; check-syntax-runner: Check Syntax pool; `#:slots` is its capacity.
+;; resyntax-runner: Resyntax pool; always one slot.
 ;; resyntax: `#f` disables follow-on work; `'place` uses the production adapter;
-;;   a procedure is a local injected task.
+;;   a procedure is a local injected task in the Resyntax pool.
 ;; timeout: Relative seconds; `enqueue!` captures one absolute deadline.
 ;; attempts: Active attempts keyed by source id and kind.
 (struct/contract Analysis-Scheduler
   ([events async-channel?]
    [analyze (or/c #f (-> Source-Snapshot? Analysis-Product?))]
-   [runner Place-Runner?]
+   [check-syntax-runner Place-Runner?]
+   [resyntax-runner Place-Runner?]
    [resyntax (or/c #f 'place (-> string? string? list?))]
    [timeout (and/c real? (>=/c 0))]
    [attempts (hash/c (cons/c Source-Id? (or/c 'check-syntax 'resyntax))
@@ -73,6 +77,7 @@
                                  #:place-start-guard [place-start-guard (lambda (thunk) (thunk))])
   (Analysis-Scheduler events analyze
                       (make-place-runner #:slots slots #:place-start-guard place-start-guard)
+                      (make-place-runner #:slots 1 #:place-start-guard place-start-guard)
                       resyntax timeout (make-hash) #f))
 
 (define (attempt-key attempt)
@@ -101,7 +106,9 @@
                          (Source-Snapshot-text snapshot) (Source-Snapshot-uri snapshot))))))
   (set-Analysis-Attempt-task!
     attempt
-    (submit-place-task! (Analysis-Scheduler-runner scheduler)
+    (submit-place-task! (if (eq? kind 'check-syntax)
+                            (Analysis-Scheduler-check-syntax-runner scheduler)
+                            (Analysis-Scheduler-resyntax-runner scheduler))
                         kind
                         snapshot (Analysis-Scheduler-events scheduler) deadline
                         (lambda (result) (Analysis-Completed attempt result)) #:work injection))
@@ -137,7 +144,7 @@
     (hash-remove! (Analysis-Scheduler-attempts scheduler) (attempt-key attempt))
     (resolve-completion! (Analysis-Attempt-completion attempt) outcome)))
 
-;; Revoke acceptance on the owner immediately. The pool handles physical cleanup.
+;; Revoke acceptance on the owner immediately. That kind's pool handles physical cleanup.
 (define (cancel-attempt! scheduler attempt reason)
   (when (registered? scheduler attempt)
     (cancel-place-task! (Analysis-Attempt-task attempt))
@@ -154,7 +161,8 @@
   (set-Analysis-Scheduler-stopped?! scheduler #t)
   (for ([attempt (in-list (hash-values (Analysis-Scheduler-attempts scheduler)))])
     (cancel-attempt! scheduler attempt 'shutdown))
-  (stop-place-runner! (Analysis-Scheduler-runner scheduler)))
+  (stop-place-runner! (Analysis-Scheduler-check-syntax-runner scheduler))
+  (stop-place-runner! (Analysis-Scheduler-resyntax-runner scheduler)))
 
 ;; Source eligibility remains an owner decision; this does no admission work.
 (define (cancel-ineligible-analysis! scheduler current?)
@@ -165,13 +173,12 @@
 ;; `accept` runs inline for the current registered attempt only. It receives
 ;; snapshot, kind, completion, parent-completion, and worker result, and returns
 ;; an `Analysis-Outcome` after installing or discarding the result and
-;; translating domain failures. Only then may the shared completion become ready.
+;; translating domain failures. Only then may this attempt's completion become ready.
 (define (finish-analysis-task! scheduler message accept)
   (define attempt (Analysis-Completed-attempt message))
   (when (registered? scheduler attempt)
-    ;; The pool posts this envelope at logical settlement. That can precede
-    ;; worker or parent cleanup on cancellation or expiry. Acceptance may change
-    ;; source state; it does not wait for the worker.
+    ;; Posted at logical settlement, which can precede worker cleanup.
+    ;; Acceptance may change source state; it does not wait for the worker.
     (define outcome
       (accept (Analysis-Attempt-snapshot attempt) (Analysis-Attempt-kind attempt)
               (Analysis-Attempt-completion attempt) (Analysis-Attempt-parent-completion attempt)

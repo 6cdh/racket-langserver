@@ -5,7 +5,9 @@
 ;; library isolation; see shared-worker-test.rkt.
 
 (module+ test
-  (require rackunit racket/async-channel racket/class racket/match racket/place racket/runtime-path
+  (require "../../lsp/analysis-place-protocol.rkt"
+           (only-in "../fixtures/analysis-place-peer.rkt" Peer-Preparing)
+           rackunit racket/async-channel racket/class racket/match racket/place racket/runtime-path
            "../../common/source.rkt" "../../common/time.rkt"
            "../../lsp/safedoc.rkt" "../../lsp/source-controller.rkt"
            (submod "../../lsp/source-controller.rkt" owner)
@@ -102,14 +104,14 @@
       (lambda (runner events spawned)
         (define old (start runner events))
         (define-values (worker control) (await-worker spawned))
-        (match-define (list 'start first-id _ _ _ _) (await control))
+        (match-define (struct* Place-Start ([id first-id])) (await control))
         (cancel-place-task! old)
         (check-stopped events)
-        (check-equal? (await control) (list 'cancel first-id))
+        (check-equal? (await control) (Place-Cancel first-id))
         (submit runner events 'resyntax)
         (check-false (sync/timeout 0 control))
         (place-channel-put control 'cancelled)
-        (match-define (list 'start next-id next-kind _ _ _) (await control))
+        (match-define (struct* Place-Start ([id next-id] [kind next-kind])) (await control))
         (check-eq? next-kind 'resyntax)
         (check-not-equal? first-id next-id)
         (cancel-place-task! old)
@@ -269,17 +271,17 @@
         (await ca)
         (submit runner events 'resyntax)
         (define-values (_b cb) (await-worker spawned))
-        (match-define (list 'start _ kind-b _ _ _) (await cb))
+        (match-define (struct* Place-Start ([kind kind-b])) (await cb))
         (check-eq? kind-b 'resyntax)
         (submit runner events 'resyntax)
         (submit runner events 'check-syntax)
         (finish! ca)
         (await events)
-        (match-define (list 'start _ next-kind-a _ _ _) (await ca))
+        (match-define (struct* Place-Start ([kind next-kind-a])) (await ca))
         (check-eq? next-kind-a 'resyntax)
         (finish! ca)
         (await events)
-        (match-define (list 'start _ final-kind-a _ _ _) (await ca))
+        (match-define (struct* Place-Start ([kind final-kind-a])) (await ca))
         (check-eq? final-kind-a 'check-syntax)
         (finish! ca)
         (await events)
@@ -293,12 +295,12 @@
       (lambda (runner events spawned)
         (define task (start runner events))
         (define-values (worker control) (await-worker spawned))
-        (check-equal? (await control) '(preparing check-syntax))
+        (check-equal? (await control) (Peer-Preparing 'check-syntax))
         (cancel-place-task! task)
         (check-stopped events)
         (start runner events)
         (place-channel-put control 'ready)
-        (match-define (list 'start _ kind _ _ _) (await control))
+        (match-define (struct* Place-Start ([kind kind])) (await control))
         (check-eq? kind 'check-syntax)
         (finish! control)
         (await events)
@@ -331,7 +333,7 @@
           ;; its eight-second budget before allowing library initialization.
           (sync (deadline-evt (+ (current-deadline-milliseconds) 5000)))
           (semaphore-post release-startup)
-          (check-equal? (await control) '(preparing check-syntax))
+          (check-equal? (await control) (Peer-Preparing 'check-syntax))
           ;; The remaining budget is at most three seconds. A renewed budget
           ;; would take eight seconds here and fail this bounded observation.
           (define outcome (sync/timeout 4 events))
@@ -500,10 +502,10 @@
       (lambda (runner events spawned)
         (define task (start runner events 5))
         (define-values (worker control) (await-worker spawned))
-        (match-define (list 'start id _ _ _ _) (await control))
+        (match-define (struct* Place-Start ([id id])) (await control))
         (define timeout (await events))
         (check-eq? (Analysis-Outcome-value timeout) 'analysis-timeout)
-        (check-equal? (await control) (list 'cancel id))
+        (check-equal? (await control) (Place-Cancel id))
         ;; A result racing cancellation certifies cleanup but cannot revive the task.
         (finish! control)
         (start runner events)
