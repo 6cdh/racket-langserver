@@ -252,7 +252,8 @@
       (lambda () (set-resyntax-enabled! #t))
       (lambda ()
         (with-session
-          (make-source-controller #:resyntax (lambda (_text _uri)
+          (make-source-controller #:analyze analyze-source
+                                  #:resyntax (lambda (_text _uri)
                                                (list (Resyntax-Result 0 5 "finding" 'test "new"))))
           (lambda (session)
             (open! session localhost-uri text 0)

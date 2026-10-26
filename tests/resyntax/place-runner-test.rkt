@@ -193,7 +193,7 @@
           (finish! control)
           (await events)
           (set! hold-cleanup? #t)
-          (start runner events 5)
+          (start runner events 0.2)
           (await control)
           (finish! control)
           (await cleaning)
@@ -500,8 +500,13 @@
   (test-case "execution deadline cancels cleanup but rejects a late success exactly once"
     (with-runner
       (lambda (runner events spawned)
-        (define task (start runner events 5))
+        ;; Initialize before timing execution so startup cannot consume the budget.
+        (start runner events)
         (define-values (worker control) (await-worker spawned))
+        (await control)
+        (finish! control)
+        (check-equal? (await events) #hasheq())
+        (define task (start runner events 0.2))
         (match-define (struct* Place-Start ([id id])) (await control))
         (define timeout (await events))
         (check-eq? (Analysis-Outcome-value timeout) 'analysis-timeout)

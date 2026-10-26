@@ -3,7 +3,7 @@
 ;; A real place with a test-controlled protocol. Assignment, preparation, and
 ;; cancellation receipts are barriers; tests decide when cleanup is acknowledged.
 (require "../../lsp/analysis-place-protocol.rkt"
-         racket/contract racket/match racket/place "../../lsp/analysis-place.rkt")
+         racket/contract racket/match racket/place racket/runtime-path)
 (provide run-peer run-unready-peer
          (struct-out Peer-Preparing) (struct-out Peer-Reply))
 
@@ -20,18 +20,21 @@
   ([message (or/c symbol? Peer-Reply?)])
   #:transparent)
 
+(define-runtime-path worker-path "../../lsp/analysis-place.rkt")
+
 (define (run-peer channel)
   (define control (place-channel-get channel))
   (define-values (local remote) (place-channel))
-  (thread (lambda () (run remote)))
+  ;; Protocol-only tests need no analysis libraries. Start the real worker only
+  ;; when a test asks to run a job; shared-worker-test.rkt covers real readiness.
+  (define worker #f)
   (define pending #f)
   (define manual-prepare? #f)
   (let loop ()
     (match (sync (handle-evt channel Peer-Wire)
                  (handle-evt control Peer-Command))
       [(Peer-Wire (Place-Prepare kind))
-       (place-channel-put local (Place-Prepare kind))
-       (define ready (place-channel-get local))
+       (define ready (Place-Ready kind))
        (if manual-prepare?
            (begin (set! pending ready) (place-channel-put control (Peer-Preparing kind)))
            (place-channel-put channel ready))]
@@ -68,6 +71,10 @@
        (match-define (struct* Place-Start ([id id])) pending)
        (place-channel-put channel (Place-Terminal id (Place-Failure "job failure")))]
       [(Peer-Command 'run)
+       (unless worker
+         (set! worker (thread (lambda () ((dynamic-require worker-path 'run) remote)))))
+       (place-channel-put local (Place-Prepare (Place-Start-kind pending)))
+       (place-channel-get local)
        (place-channel-put local pending)
        (place-channel-put channel (place-channel-get local))
        (place-channel-put control 'cleaned)]
