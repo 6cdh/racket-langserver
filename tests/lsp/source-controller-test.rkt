@@ -94,10 +94,11 @@
                     (define b-read (await probes))
                     (open! session a "#lang racket/base\n(define value 1)\nvalue\n")
                     (barrier session)
-                    ;; Wait for publishDiagnostics, which Check Syntax sends
-                    ;; before installing the trace. Then query the local binding.
+                    ;; Cold startup can exceed the command timeout when tests
+                    ;; run concurrently. Publication certifies an installed trace.
+                    ;; Then query the local binding.
                     (let loop ()
-                      (define msg (await (Session-notifications session)))
+                      (define msg (await (Session-notifications session) 30))
                       (unless (equal? (hash-ref msg 'method #f) "textDocument/publishDiagnostics")
                         (loop)))
                     (define old-view (view session a))

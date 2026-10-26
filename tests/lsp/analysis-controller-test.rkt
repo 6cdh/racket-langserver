@@ -9,6 +9,7 @@
          racket/logging
          racket/list
          racket/place
+         racket/runtime-path
          "../../common/debug.rkt"
          "../../common/interfaces.rkt"
          "../../common/json-util.rkt"
@@ -20,7 +21,6 @@
          (submod "../../lsp/analysis.rkt" test-support)
          "../../lsp/analysis-query.rkt"
          "../../lsp/lsp.rkt"
-         "../../lsp/resyntax-place.rkt"
          "../../lsp/safedoc.rkt"
          "../../lsp/source-controller.rkt"
          (submod "../../lsp/source-controller.rkt" owner)
@@ -29,7 +29,9 @@
          "../../workspace/source-store.rkt"
          (only-in "../../lsp/source-controller/analysis-scheduler.rkt" Analysis-Completed?)
          "controller-support.rkt"
-         "../lib/resyntax-place-test-support.rkt")
+         (submod "../../lsp/source-controller/place-runner.rkt" test-support))
+
+(define-runtime-path shared-peer "../fixtures/analysis-place-peer.rkt")
 
 (define text "#lang racket/base\n(define value 1)\nvalue\n")
 
@@ -149,7 +151,8 @@
     (source-controller-open! controller source sd)
     (define event (with-read-safedoc sd SafeDoc-analysis-completion))
     (check-true (evt? event) "opening schedules its own analysis")
-    (source-controller-handle! controller (await (source-controller-events controller)))
+    ;; Cold Check Syntax also loads Doc, including its eager optional imports.
+    (source-controller-handle! controller (await (source-controller-events controller) 30))
     (check-eq? 'succeeded (Analysis-Outcome-state (await event)))
     (define definitions
       (with-read-doc sd
@@ -394,11 +397,9 @@
                                           "(begin-for-syntax\n"
                                           "  (custodian-shutdown-all (current-custodian)))\n"))
                     (define first-probe (await probes))
-                    (open! session b text)
                     (barrier session)
                     (define first (acquire session a))
                     (define peer (acquire session a))
-                    (define queued (acquire session b))
                     (request session "textDocument/inlayHint" 18 a)
                     (barrier session)
                     (check-false (sync/timeout 0 probes))
@@ -410,6 +411,8 @@
                                            '(worker-exited analysis-timeout)))
                     (check-eq? (await first) (await peer))
                     (check-error (response session 18) ErrorCode-RequestFailed)
+                    (open! session b text)
+                    (define queued (acquire session b))
                     (define next-probe (await probes))
                     (check-equal? (Source-Snapshot-id (Gate-input next-probe))
                                   (source-id (path->source b)))
@@ -685,48 +688,56 @@
         (barrier session)))))
 
 (module+ test
-  (test-case "actual Resyntax place death is discarded and a later revision uses a fresh place"
+  (test-case "shared Resyntax worker death discards findings and the next revision recovers"
     (define old-enabled (get-resyntax-enabled))
+    (define created (make-async-channel))
     (dynamic-wind
       (lambda () (set-resyntax-enabled! #t))
       (lambda ()
-        (call-with-controlled-workers
-          (lambda (created)
-            (define probes (make-async-channel))
-            (define logs (make-log-receiver racket-langserver-logger 'info))
-            (with-session (make-source-controller #:analyze (controlled-analyzer probes))
-                          (lambda (session)
-                            (define path (build-path scratch "actual-resyntax-death.rkt"))
-                            (open! session path text)
-                            (release-gate! (await probes))
-                            (barrier session)
-                            (define accepted (await (acquire session path)))
-                            (define old (await created))
-                            (check-equal? (await (Controlled-Worker-notice old)) (list text (path->uri path)))
-                            (place-channel-put (Controlled-Worker-control old) 'die)
-                            (let loop ()
-                              (define log (await logs))
-                              (unless (regexp-match? #rx"Resyntax discarded" (vector-ref log 1)) (loop)))
-                            (check-eq? accepted (await (acquire session path)))
-                            (check-equal? (length (notifications session)) 1 "only Check Syntax publishes")
-                            (check-false (get-resyntax-worker))
-                            (change! session path text 1)
-                            (release-gate! (await probes))
-                            (barrier session)
-                            (await (acquire session path))
-                            (define fresh (await created))
-                            (check-not-eq? (Controlled-Worker-place fresh) (Controlled-Worker-place old))
-                            (await (Controlled-Worker-notice fresh))
-                            (define finding (Resyntax-Result 0 5 "accepted" 'test "new"))
-                            (place-channel-put (Controlled-Worker-control fresh) (list (->jsexpr finding)))
-                            (await (Session-notifications session)) ; Check Syntax
-                            (define publication (hash-ref (await (Session-notifications session)) 'params))
-                            (check-not-false
-                              (member "[test] accepted"
-                                      (map (lambda (diag) (hash-ref diag 'message))
-                                           (hash-ref publication 'diagnostics))))
-                            (close! session path)
-                            (barrier session))))))
+        (parameterize ([current-place-factory
+                        (lambda (_guard)
+                          (define worker (dynamic-place shared-peer 'run-peer))
+                          (define-values (control remote) (place-channel))
+                          (place-channel-put worker remote)
+                          (async-channel-put created (cons worker control))
+                          worker)])
+          (define probes (make-async-channel))
+          (define logs (make-log-receiver racket-langserver-logger 'info))
+          (with-session
+            (make-source-controller #:analyze (controlled-analyzer probes) #:resyntax 'place
+                                    #:analysis-slots 1)
+            (lambda (session)
+              (define path (build-path scratch "actual-resyntax-death.rkt"))
+              (open! session path text)
+              (release-gate! (await probes))
+              (barrier session)
+              (define accepted (await (acquire session path)))
+              (match-define (cons old control) (await created))
+              (check-match (await control) (list 'start _ 'resyntax _ _ _))
+              (place-channel-put control 'die)
+              (let loop ()
+                (define log (await logs))
+                (unless (regexp-match? #rx"Resyntax discarded" (vector-ref log 1)) (loop)))
+              (check-eq? accepted (await (acquire session path)))
+              (check-equal? (length (notifications session)) 1 "only Check Syntax publishes")
+              (check-not-false (sync/timeout 5 (place-dead-evt old)))
+              (change! session path text 1)
+              (release-gate! (await probes))
+              (barrier session)
+              (await (acquire session path))
+              (match-define (cons fresh fresh-control) (await created))
+              (check-not-eq? fresh old)
+              (check-match (await fresh-control) (list 'start _ 'resyntax _ _ _))
+              (define finding (Resyntax-Result 0 5 "accepted" 'test "new"))
+              (place-channel-put fresh-control (list 'reply (list 'result (list (->jsexpr finding)))))
+              (await (Session-notifications session))
+              (define publication (hash-ref (await (Session-notifications session)) 'params))
+              (check-not-false
+                (member "[test] accepted"
+                        (map (lambda (diag) (hash-ref diag 'message))
+                             (hash-ref publication 'diagnostics))))
+              (close! session path)
+              (barrier session)))))
       (lambda () (set-resyntax-enabled! old-enabled)))))
 
 (module+ test
@@ -922,7 +933,7 @@
                        (await started)
                        (async-channel-put release (list (Resyntax-Result 0 5 "obsolete" 'test "bad")))
                        ;; Capture the actual completed worker message before invalidation.
-                       ;; Its delivery is now controlled by the owner, not by scheduling.
+                       ;; The owner, not scheduling, decides when that message is delivered.
                        (define stale (await (source-controller-events controller)))
                        (check-pred Analysis-Completed? stale)
                        (source-controller-edit! controller sd (lambda (doc) (doc-update-version! doc 8)))

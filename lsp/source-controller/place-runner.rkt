@@ -1,231 +1,530 @@
 #lang racket/base
 
-;; Session-owned reusable places, with no pending queue. The scheduler
-;; reserves a slot before launch. A bridge supervises startup through restoration,
-;; and retains the reservation until cancelled places have terminated.
-;; A session may wrap native place creation with `place-start-guard`.
-(require racket/async-channel
+;; One manager owns the FIFO, deadlines, and physical reservations. Logical
+;; settlement never releases a slot; cleanup or observed retirement does.
+;; Task deadlines, normally 90 seconds from submission, include queueing and
+;; parent restoration. Expiry cancels the task while preserving a responsive
+;; worker. The separate startup watchdog, also 90 seconds by default, covers
+;; native creation plus first stack initialization. Its expiry retires that
+;; worker. Cross-file rules are in ../analysis-lifecycle.md.
+(require data/queue
+         racket/async-channel
+         racket/contract
+         racket/list
          racket/match
          racket/place
          racket/port
          racket/runtime-path
          "../../common/time.rkt"
+         "../../common/json-util.rkt"
+         "../../common/interfaces.rkt"
          "../../workspace/source-store.rkt"
          "../analysis.rkt")
 
-(provide Place-Runner? Place-Task? make-place-runner place-runner-available?
-         start-place-task! cancel-place-task! stop-place-runner!)
+(provide Place-Runner? Place-Task? make-place-runner
+         submit-place-task! start-place-task! cancel-place-task! stop-place-runner!
+         place-runner-shutdown-evt)
 
 (define-runtime-path worker-path "../analysis-place.rkt")
 
-(define (spawn-worker place-start-guard)
-  ;; The file-stream stdout sink and closed stdin pipe need no pump threads.
-  ;; Supplied stdout/stderr ports make both returned port values #f. The parent
-  ;; stderr port may still need a pump, which place-wait joins at retirement.
+(define (spawn-worker guard)
+  ;; The worker custodian owns this port through warm reuse. Retirement closes
+  ;; it, including when startup fails before a place handle is recorded.
   (define sink
     (open-output-file (if (eq? (system-type) 'windows) "NUL" "/dev/null") #:exists 'append))
   (define-values (worker input _stdout _stderr)
-    (place-start-guard
-      (lambda () (dynamic-place* worker-path 'run #:out sink #:err (current-error-port)))))
+    (guard (lambda () (dynamic-place* worker-path 'run #:out sink #:err (current-error-port)))))
   (close-output-port input)
   worker)
 
-;; Test factories still create real places. They can establish startup barriers
-;; or substitute a wire peer without transporting an analysis closure.
-;; The runner passes its `place-start-guard`. Apply it around native creation
-;; when the test is exercising that path.
+;; Pool construction captures resource dependencies and watchdogs. Restoration
+;; belongs to a submission and captures its submitting thread's parameterization.
 (define current-place-factory (make-parameter spawn-worker))
 (define current-analysis-restorer (make-parameter restore-analysis))
-(module+ test-support (provide current-place-factory current-analysis-restorer))
+(define current-cleanup-seconds (make-parameter 1))
+(define current-startup-seconds (make-parameter 90))
+;; The narrow cleanup seam lets tests hold a real reservation through cleanup.
+(define current-parent-cleaner (make-parameter custodian-shutdown-all))
+(module+ test-support
+  (provide current-place-factory current-analysis-restorer
+           current-cleanup-seconds current-startup-seconds current-parent-cleaner))
 
-;; One physical place and its resource boundary, retained across job assignments.
-;; Reply identity belongs to the unique job ID, not to this resource record.
+;; Admission boundary for the manager thread.
 ;;
-;; custodian: Owns the place and stdout sink, including interrupted startup
-;;   before the place handle is stored.
-;; worker: #f until startup returns its place handle.
-(struct Generation (custodian [worker #:mutable]))
-(struct Place-Task (cancel))
-;; Each slot stays reserved through restoration or observed retirement, so both
-;; physical places and parent-side work remain bounded by the configured capacity.
-(struct Worker-Slot ([generation #:mutable] [task #:mutable]))
-;; Session place pool. `lock` serializes slot assignment and retirement.
+;; commands: Submit, cancel, and stop messages for the manager.
+;; gate: Serializes those commands with stop so none arrive after the manager
+;;   may exit.
+;; shutdown: Posted after the manager returns.
+;; stopped?: Set at stop so later submits are answered here without a manager.
+;; manager: Manager thread; shutdown-evt also waits for its death.
+(struct/contract Place-Runner
+  ([commands async-channel?]
+   [gate semaphore?]
+   [shutdown semaphore?]
+   [(stopped? #:mutable) boolean?]
+   [(manager #:mutable) (or/c #f thread?)]))
+
+;; The handle denotes exactly one submission, including after settlement.
 ;;
-;; owner-custodian: Owns places and their cleanup bridges, so disposing the
-;;   consumer's custodian cannot interrupt retirement.
-;; place-start-guard: Wraps only `dynamic-place*`. Must preserve multiple values.
-;; serial: Job IDs across all slots and replacements in this runner.
-(struct Place-Runner (lock owner-custodian place-start-guard slots
-                           [serial #:mutable] [stopped? #:mutable]))
+;; runner: Admission and cancellation boundary; no physical worker identity
+;;   escapes.
+;; kind: `'check-syntax` or `'resyntax`, shared by the analysis scheduler,
+;;   manager, and worker.
+;; snapshot: Immutable source input retained in the parent for restoration.
+;; deadline: Absolute monotonic milliseconds, captured once at submission.
+;; directory: Submission directory, used for worker execution and parent work.
+;; events: Caller channel receiving one logical terminal notification, possibly
+;;   before physical cleanup finishes on cancellation or expiry.
+;; done: Caller envelope constructor wrapping the terminal result; never
+;;   installs source results or publishes.
+;; work: Optional local test procedure; `#f` selects the fixed place adapter.
+;; restorer: Check Syntax restoration procedure captured at submission.
+;; active?: Cleared at logical settlement; capacity can remain reserved afterward.
+(struct/contract Place-Task
+  ([runner Place-Runner?]
+   [kind (or/c 'check-syntax 'resyntax)]
+   [snapshot Source-Snapshot?]
+   [deadline real?]
+   [directory path?]
+   [events async-channel?]
+   [done (-> any/c any/c)]
+   [work (or/c #f (-> any/c))]
+   [restorer (-> Source-Snapshot? boolean? any/c any/c)]
+   [(active? #:mutable) boolean?]))
 
-;; (->* () (#:slots exact-positive-integer? #:place-start-guard (-> (-> any) any)) Place-Runner?)
-(define (make-place-runner #:slots [slots 1]
-                           #:place-start-guard [place-start-guard (lambda (thunk) (thunk))])
-  (unless (exact-positive-integer? slots)
-    (raise-argument-error 'make-place-runner "exact-positive-integer?" slots))
-  (Place-Runner (make-semaphore 1) (current-custodian) place-start-guard
-                (for/list ([_ (in-range slots)]) (Worker-Slot #f #f)) 0 #f))
+;; Physical place and its initialized stacks. Independent of the current task.
+;; A spawning worker already owns a custodian, even before `place` is recorded.
+;;
+;; custodian: Owns the place from spawn through retirement.
+;; place: `#f` until native creation returns.
+;; ready: Initialized task kinds. Not a liveness flag; death uses `dead?`.
+;; dead?: Recorded until retirement. A dead worker never becomes idle.
+;; events: Wire and death events, built once when `place` is recorded.
+(struct/contract Worker
+  ([custodian custodian?]
+   [(place #:mutable) (or/c #f place?)]
+   [(ready #:mutable) (listof (or/c 'check-syntax 'resyntax))]
+   [(dead? #:mutable) boolean?]
+   [(events #:mutable) (listof evt?)]))
 
-(define (locked runner proc)
-  (call-with-semaphore (Place-Runner-lock runner) proc))
+;; Completion callbacks run only on the manager. Helpers deliver a callback
+;; carrying their result; they never mutate pool state or release capacity.
+(struct/contract Async-Task
+  ([thread thread?]
+   [event evt?]))
 
-;; Cleanup must survive disposal of the consumer's custodian. Places and
-;; bridges share the runner's owning lifetime; each job has a narrower boundary.
-(define (runner-thread runner thunk)
-  (parameterize ([current-custodian (Place-Runner-owner-custodian runner)]) (thread thunk)))
+;; A slot reserves capacity through startup, execution, parent work, and
+;; retirement.
+;;
+;; worker: Physical resource, independent of the task and parent-work custody.
+;; task: Current assignment; may already be settled while this slot stays reserved.
+;; phase: `empty` and `idle` are assignable; every other phase reserves this
+;;   capacity.
+;; until: Absolute startup, initialization, or cancellation watchdog
+;;   milliseconds; `#f` outside those phases, independent of the task deadline.
+;; id: Unique assignment ID retained through cancellation and cleanup.
+;; async: Current helper and its manager-thread completion event, or `#f`.
+;; work-custodian: Parent restoration or injected work, retained through cleanup.
+(struct/contract Slot
+  ([(worker #:mutable) (or/c #f Worker?)]
+   [(task #:mutable) (or/c #f Place-Task?)]
+   [(phase #:mutable) (or/c 'empty 'idle 'spawning 'preparing 'executing 'cancelling
+                            'restoring 'injected 'cleaning 'retiring)]
+   [(until #:mutable) (or/c #f real?)]
+   [(id #:mutable) (or/c #f exact-positive-integer?)]
+   [(async #:mutable) (or/c #f Async-Task?)]
+   [(work-custodian #:mutable) (or/c #f custodian?)]))
 
-;; (-> Place-Runner? boolean?)
-(define (place-runner-available? runner)
-  (locked runner (lambda () (and (not (Place-Runner-stopped? runner))
-                                 (for/or ([slot (in-list (Place-Runner-slots runner))])
-                                   (not (Worker-Slot-task slot)))))))
+;; Manager-only mutable pool. Helpers report callbacks; they never release slots.
+;;
+;; tasks: Logically active submissions. A slot may still hold a settled task.
+;; owner: Session custodian; retirement and cleanup helpers stay under it.
+;; guard / factory: Physical startup captured at construction.
+;; cleanup-ms / startup-ms: Watchdog durations captured at construction.
+;; cleaner: Parent-work teardown, also captured at construction.
+;; serial: Assignment IDs, unique across replacements; not a slot index.
+(struct/contract Pool
+  ([slots (listof Slot?)]
+   [queue queue?]
+   [tasks (hash/c Place-Task? boolean? #:immutable #f)]
+   [owner custodian?]
+   [guard (-> (-> any) any)]
+   [factory (-> procedure? place?)]
+   [cleanup-ms (and/c real? (>=/c 0))]
+   [startup-ms (and/c real? (>=/c 0))]
+   [cleaner (-> custodian? any)]
+   [command-event evt?]
+   [(stopped? #:mutable) boolean?]
+   [(serial #:mutable) exact-nonnegative-integer?]))
 
-;; (-> Place-Task? void?)
-(define (cancel-place-task! task)
-  ;; This handle can only signal its own bridge, even after the place is reused.
-  (semaphore-post (Place-Task-cancel task)))
-
-(define (retire-generation! runner generation)
-  ;; Startup can be interrupted between place creation and recording its handle.
-  ;; Stop the startup thread first, then collect its custodian's places too.
-  (define workers
-    (filter place? (custodian-managed-list (Generation-custodian generation)
-                                           (Place-Runner-owner-custodian runner))))
-  (for ([worker (in-list workers)]) (place-kill worker))
-  ;; Let any remaining port pumps finish before shutting down their custodian.
-  (for ([worker (in-list workers)]) (place-wait worker))
-  (custodian-shutdown-all (Generation-custodian generation)))
-
-;; (-> Place-Runner? void?) — initiates cleanup without waiting for termination.
-(define (stop-place-runner! runner)
-  (define idle
-    (locked runner
-            (lambda ()
-              (set-Place-Runner-stopped?! runner #t)
-              (for/fold ([idle '()]) ([slot (in-list (Place-Runner-slots runner))])
-                (define task (Worker-Slot-task slot))
-                (define generation (Worker-Slot-generation slot))
-                (cond
-                  [task
-                   (cancel-place-task! task)
-                   idle]
-                  [generation
-                   (set-Worker-Slot-generation! slot #f)
-                   (cons generation idle)]
-                  [else idle])))))
-  (for ([generation (in-list idle)])
-    (runner-thread runner (lambda () (retire-generation! runner generation))))
-  (void))
-
-(define (failure reason)
-  (Analysis-Outcome 'failed
-                    (if (exn? reason) (exn-message reason)
-                        "analysis execution raised a non-exception value")))
-
-(define (receive-reply worker)
-  (sync worker
-        (handle-evt (place-dead-evt worker)
-                    (lambda (_)
-                      ;; A final reply and death may both be ready. Replies are
-                      ;; lists, so a #f poll means no queued reply.
-                      (or (sync/timeout 0 worker)
-                          (error 'place-runner "worker exited"))))))
-
-(define (execute-job runner generation job snapshot place-reusable?)
-  (unless (Generation-worker generation)
-    (define worker
-      (parameterize ([current-custodian (Generation-custodian generation)])
-        ((current-place-factory) (Place-Runner-place-start-guard runner))))
-    (set-Generation-worker! generation worker))
-  (define worker (Generation-worker generation))
-  (place-channel-put worker
-                     (list job (Source-Snapshot-uri snapshot)
-                           (Source-Snapshot-text snapshot) (current-directory)))
-  (match (receive-reply worker)
-    [(list (== job) (list 'result (? boolean? succeeded?) data))
-     ;; Job resources are gone. Restoration failure or cancellation still
-     ;; reuses this place.
-     (set-box! place-reusable? #t)
-     ((current-analysis-restorer) snapshot succeeded? data)]
-    [(list (== job) (list 'failure (? string? detail)))
-     ;; Cleanup ran, but the exception may have touched place-wide state outside
-     ;; the job custodian. Fail the attempt and retire this place.
-     (Analysis-Outcome 'failed detail)]
-    [_ (error 'place-runner "invalid worker reply")]))
-
-;; (-> Place-Runner? Source-Snapshot? async-channel? real? procedure? Place-Task?)
-;; seconds is nonnegative.
-;; Requires an available runner. done runs on the bridge thread; its returned
-;; envelope is sent to events after cleanup. The owner alone accepts the result.
-(define (start-place-task! runner snapshot events seconds done)
-  (define deadline (+ (current-deadline-milliseconds) (* 1000 seconds)))
-  (define task (Place-Task (make-semaphore 0)))
-  (define-values (slot generation retired job)
-    (locked runner
-            (lambda ()
-              (define slot
-                (for/first ([slot (in-list (Place-Runner-slots runner))]
-                            #:unless (Worker-Slot-task slot))
-                  slot))
-              (when (or (Place-Runner-stopped? runner) (not slot))
-                (error 'start-place-task! "runner is unavailable"))
-              (set-Place-Runner-serial! runner (add1 (Place-Runner-serial runner)))
-              (define job (Place-Runner-serial runner))
-              (define previous (Worker-Slot-generation slot))
-              (define dead?
-                (and previous (Generation-worker previous)
-                     (sync/timeout 0 (place-dead-evt (Generation-worker previous)))))
-              (when (or (not previous) dead?)
-                (set-Worker-Slot-generation!
-                  slot (Generation (make-custodian (Place-Runner-owner-custodian runner)) #f)))
-              (set-Worker-Slot-task! slot task)
-              (values slot (Worker-Slot-generation slot) (and dead? previous) job))))
-  (runner-thread
+(define (make-place-runner #:slots [count 4]
+                           #:place-start-guard [guard (lambda (thunk) (thunk))]
+                           #:place-factory [factory (current-place-factory)])
+  (unless (exact-positive-integer? count)
+    (raise-argument-error 'make-place-runner "exact-positive-integer?" count))
+  (define runner (Place-Runner (make-async-channel) (make-semaphore 1) (make-semaphore 0) #f #f))
+  (define pool
+    (Pool (for/list ([_ (in-range count)]) (Slot #f #f 'empty #f #f #f #f))
+          (make-queue) (make-hasheq) (current-custodian) guard factory
+          (* 1000 (current-cleanup-seconds)) (* 1000 (current-startup-seconds))
+          (current-parent-cleaner)
+          (handle-evt (Place-Runner-commands runner) (lambda (cmd) (list 'command cmd)))
+          #f 0))
+  (set-Place-Runner-manager!
     runner
+    (thread (lambda ()
+              (run-pool-manager pool)
+              (semaphore-post (Place-Runner-shutdown runner)))))
+  runner)
+
+(define (submit-place-task! runner kind snapshot events deadline done #:work [work #f])
+  (define task
+    (Place-Task runner kind snapshot deadline (current-directory)
+                events done work (current-analysis-restorer) #t))
+  (call-with-semaphore
+    (Place-Runner-gate runner)
     (lambda ()
-      ;; An idle worker may die after its last reply. Observe its retirement
-      ;; before creating a replacement for this assignment.
-      (when retired (retire-generation! runner retired))
-      (define custodian (make-custodian))
-      (define results (make-async-channel))
-      ;; The job thread sets this before restoration after accepting a normal
-      ;; result. Read it only after stopping that thread below. The side channel
-      ;; preserves reuse if cancellation or timeout interrupts restoration.
-      (define place-reusable? (box #f))
-      (define work
-        (parameterize ([current-custodian custodian]
-                       [current-output-port (open-output-nowhere)])
-          (thread
-            (lambda ()
-              (async-channel-put results
-                                 (with-handlers ([(lambda (_) #t) failure])
-                                   (execute-job runner generation job snapshot place-reusable?)))))))
-      (define result
-        (sync results
-              (handle-evt (semaphore-peek-evt (Place-Task-cancel task))
-                          (lambda (_) (Analysis-Outcome 'stopped 'cancelled)))
-              (handle-evt (deadline-evt deadline)
-                          (lambda (_) (Analysis-Outcome 'failed 'analysis-timeout)))
-              (handle-evt (thread-dead-evt work)
-                          (lambda (_)
-                            (or (sync/timeout 0 results)
-                                (Analysis-Outcome 'failed 'worker-exited))))))
-      (custodian-shutdown-all custodian)
-      (define retire?
-        (locked runner
-                (lambda ()
-                  (define retire? (or (not (unbox place-reusable?)) (Place-Runner-stopped? runner)))
-                  (unless retire? (set-Worker-Slot-task! slot #f))
-                  retire?)))
-      ;; Keep the runner lock released across place-wait so shutdown and
-      ;; dispatch never wait on termination while acquiring that lock.
-      (when retire?
-        (retire-generation! runner generation)
-        (locked runner
-                (lambda ()
-                  (set-Worker-Slot-generation! slot #f)
-                  (set-Worker-Slot-task! slot #f))))
-      ;; Includes cancellation: the stale completion wakes dispatch only after
-      ;; physical capacity is free. Acceptance still checks attempt identity.
-      (async-channel-put events (done result))))
+      (if (Place-Runner-stopped? runner)
+          (notify-task! task (Analysis-Outcome 'stopped 'shutdown))
+          (async-channel-put (Place-Runner-commands runner) (list 'submit task)))))
   task)
+
+;; Convenience for direct callers; the controller passes an already captured deadline.
+(define (start-place-task! runner snapshot events seconds done)
+  (submit-place-task! runner 'check-syntax snapshot events
+                      (+ (current-deadline-milliseconds) (* 1000 seconds)) done))
+
+(define (cancel-place-task! task)
+  (define runner (Place-Task-runner task))
+  (call-with-semaphore
+    (Place-Runner-gate runner)
+    (lambda ()
+      (unless (Place-Runner-stopped? runner)
+        (async-channel-put (Place-Runner-commands runner) (list 'cancel task))))))
+
+(define (stop-place-runner! runner)
+  (call-with-semaphore
+    (Place-Runner-gate runner)
+    (lambda ()
+      (unless (Place-Runner-stopped? runner)
+        (set-Place-Runner-stopped?! runner #t)
+        (async-channel-put (Place-Runner-commands runner) '(stop))))))
+
+(define (place-runner-shutdown-evt runner)
+  ;; Abnormal manager death must not report successful physical cleanup.
+  (replace-evt (semaphore-peek-evt (Place-Runner-shutdown runner))
+               (lambda (_) (thread-dead-evt (Place-Runner-manager runner)))))
+
+;; Only malformed worker messages cross this recovery boundary. Manager bugs
+;; must escape instead of being reported as one worker's protocol failure.
+(struct/contract exn:fail:place-protocol exn:fail ())
+
+(define (raise-protocol-error message)
+  (raise (exn:fail:place-protocol (string-append "place-runner: " message)
+                                  (current-continuation-marks))))
+
+(define (failed reason)
+  (Analysis-Outcome 'failed (if (exn? reason) (exn-message reason) reason)))
+
+(define (notify-task! task outcome)
+  (set-Place-Task-active?! task #f)
+  (async-channel-put (Place-Task-events task) ((Place-Task-done task) outcome)))
+
+(define (settle! pool task outcome)
+  (when (Place-Task-active? task)
+    (hash-remove! (Pool-tasks pool) task)
+    (notify-task! task outcome)))
+
+(define (launch! pool slot phase thunk completed failed! [custodian (Pool-owner pool)])
+  (define results (make-async-channel))
+  (define helper
+    (parameterize ([current-custodian custodian])
+      (thread
+        (lambda ()
+          (define finish
+            (with-handlers ([(lambda (_) #t)
+                             (lambda (reason)
+                               (define outcome (failed reason))
+                               (lambda () (failed! outcome)))])
+              (define value (thunk))
+              (lambda () (completed value))))
+          (async-channel-put results finish)))))
+  (define event
+    (choice-evt
+      (handle-evt results (lambda (finish) (list 'async finish)))
+      (handle-evt (thread-dead-evt helper)
+                  (lambda (_)
+                    (list 'async
+                          (or (async-channel-try-get results)
+                              (lambda () (failed! (failed 'worker-exited)))))))))
+  (set-Slot-phase! slot phase)
+  (set-Slot-async! slot (Async-Task helper event)))
+
+(define (stop-helper! slot)
+  (when (Slot-async slot) (kill-thread (Async-Task-thread (Slot-async slot))))
+  (set-Slot-async! slot #f))
+
+;; Clearing a reservation either exposes a live warm worker or starts retirement.
+;; A dead worker never passes through idle, even after a valid result is restored.
+(define (clear! pool slot)
+  (set-Slot-id! slot #f)
+  (set-Slot-task! slot #f)
+  (set-Slot-async! slot #f)
+  (set-Slot-work-custodian! slot #f)
+  (set-Slot-until! slot #f)
+  (cond
+    [(not (Slot-worker slot)) (set-Slot-phase! slot 'empty)]
+    [(Worker-dead? (Slot-worker slot)) (retire! pool slot)]
+    [else (set-Slot-phase! slot 'idle)]))
+
+(define (fail-slot! pool slot outcome)
+  (when (Slot-task slot) (settle! pool (Slot-task slot) outcome))
+  (retire! pool slot))
+
+(define (retire! pool slot)
+  (unless (eq? (Slot-phase slot) 'retiring)
+    (stop-helper! slot)
+    (define worker (Slot-worker slot))
+    (define work-custody (Slot-work-custodian slot))
+    (set-Slot-until! slot #f)
+    (launch! pool slot 'retiring
+             (lambda ()
+               (when work-custody (custodian-shutdown-all work-custody))
+               (when worker
+                 (define custody (Worker-custodian worker))
+                 ;; Includes a place created before the startup helper recorded it.
+                 (define places (filter place? (custodian-managed-list custody (Pool-owner pool))))
+                 (for ([place (in-list places)]) (place-kill place))
+                 (for ([place (in-list places)]) (place-wait place))
+                 (custodian-shutdown-all custody)))
+             (lambda (_)
+               (set-Slot-worker! slot #f)
+               (clear! pool slot))
+             (lambda (outcome) (error 'place-runner "worker retirement failed: ~v" outcome)))))
+
+(define (clean-parent! pool slot [outcome #f])
+  (stop-helper! slot)
+  (define custody (Slot-work-custodian slot))
+  (launch! pool slot 'cleaning
+           (lambda () ((Pool-cleaner pool) custody))
+           (lambda (_)
+             ;; Timers can settle during async cleanup. This boundary also
+             ;; rejects success if cleanup completed after the task deadline.
+             (define task (Slot-task slot))
+             (when (and task (Place-Task-active? task))
+               (settle! pool task
+                        (if (>= (current-deadline-milliseconds) (Place-Task-deadline task))
+                            (failed 'analysis-timeout) outcome)))
+             (clear! pool slot))
+           (lambda (outcome) (fail-slot! pool slot outcome))))
+
+(define (cancel! pool task outcome)
+  (when (Place-Task-active? task)
+    (settle! pool task outcome)
+    (queue-filter! (Pool-queue pool) (lambda (waiting) (not (eq? waiting task))))
+    (define slot
+      (for/first ([slot (in-list (Pool-slots pool))] #:when (eq? task (Slot-task slot))) slot))
+    (when slot
+      (case (Slot-phase slot)
+        [(executing)
+         (place-channel-put (Worker-place (Slot-worker slot)) (list 'cancel (Slot-id slot)))
+         (set-Slot-phase! slot 'cancelling)
+         (set-Slot-until! slot (+ (current-deadline-milliseconds) (Pool-cleanup-ms pool)))]
+        [(restoring injected) (clean-parent! pool slot)]
+        ;; Startup and initialization survive cancellation with their original
+        ;; watchdog. A cancelled task is never started on the prepared worker.
+        [else (void)]))))
+
+(define (start-local! pool slot task thunk phase)
+  (define custody (make-custodian (Pool-owner pool)))
+  (set-Slot-work-custodian! slot custody)
+  (launch! pool slot phase
+           (lambda ()
+             (parameterize ([current-directory (Place-Task-directory task)]
+                            [current-output-port (open-output-nowhere)])
+               (thunk)))
+           (lambda (value) (clean-parent! pool slot value))
+           (lambda (outcome) (clean-parent! pool slot outcome))
+           custody))
+
+(define (start-job! slot task)
+  (set-Slot-phase! slot 'executing)
+  (set-Slot-until! slot #f)
+  (define input (Place-Task-snapshot task))
+  (place-channel-put (Worker-place (Slot-worker slot))
+                     (list 'start (Slot-id slot) (Place-Task-kind task)
+                           (Source-Snapshot-uri input) (Source-Snapshot-text input)
+                           (Place-Task-directory task))))
+
+;; Dispatch arms the startup watchdog. A newly created place uses the remainder
+;; of that same budget for its first library initialization.
+(define (initialize-kind! slot task)
+  (set-Slot-phase! slot 'preparing)
+  (place-channel-put (Worker-place (Slot-worker slot)) (list 'prepare (Place-Task-kind task))))
+
+(define (worker-spawned! slot place)
+  (define worker (Slot-worker slot))
+  (set-Worker-place! worker place)
+  (set-Worker-events!
+    worker
+    (list (handle-evt place (lambda (reply) (list 'wire slot reply)))
+          (handle-evt (place-dead-evt place) (lambda (_) (list 'dead slot)))))
+  (set-Slot-async! slot #f)
+  ;; Initialize even if the first assignment was cancelled.
+  (initialize-kind! slot (Slot-task slot)))
+
+(define (dispatch! pool slot task)
+  (set-Slot-task! slot task)
+  ;; IDs belong to assignments, not slots. Obsolete replies cannot complete a
+  ;; later task even when the same physical worker is reused.
+  (set-Pool-serial! pool (add1 (Pool-serial pool)))
+  (set-Slot-id! slot (Pool-serial pool))
+  (cond
+    [(Place-Task-work task) (start-local! pool slot task (Place-Task-work task) 'injected)]
+    [(and (Slot-worker slot) (memq (Place-Task-kind task) (Worker-ready (Slot-worker slot))))
+     (start-job! slot task)]
+    [else
+     (set-Slot-until! slot (+ (current-deadline-milliseconds) (Pool-startup-ms pool)))
+     (cond
+       [(Slot-worker slot) (initialize-kind! slot task)]
+       [else
+        (define custody (make-custodian (Pool-owner pool)))
+        (set-Slot-worker! slot (Worker custody #f '() #f '()))
+        (launch! pool slot 'spawning
+                 (lambda () ((Pool-factory pool) (Pool-guard pool)))
+                 (lambda (place) (worker-spawned! slot place))
+                 (lambda (outcome) (fail-slot! pool slot outcome))
+                 custody)])]))
+
+(define (assign-queued! pool)
+  (define slot
+    (for/first ([slot (in-list (Pool-slots pool))]
+                #:when (memq (Slot-phase slot) '(empty idle)))
+      slot))
+  (when (and slot (not (queue-empty? (Pool-queue pool))))
+    (dispatch! pool slot (dequeue! (Pool-queue pool)))
+    (assign-queued! pool)))
+
+(define (wire! pool slot message)
+  (define task (Slot-task slot))
+  (match message
+    [(list 'ready kind)
+     (unless (and (eq? (Slot-phase slot) 'preparing)
+                  task (eq? kind (Place-Task-kind task)))
+       (raise-protocol-error "unexpected readiness"))
+     (define worker (Slot-worker slot))
+     (set-Worker-ready! worker (cons kind (Worker-ready worker)))
+     (if (Place-Task-active? task) (start-job! slot task) (clear! pool slot))]
+    [(list 'terminal (? exact-positive-integer? id) payload)
+     (unless (and task (= id (Slot-id slot))
+                  (memq (Slot-phase slot) '(executing cancelling)))
+       (raise-protocol-error "unexpected terminal reply"))
+     (set-Slot-until! slot #f)
+     (match payload
+       [(list 'failure (? string? detail))
+        (settle! pool task (failed detail))
+        (clear! pool slot)]
+       [(list 'cancelled)
+        (settle! pool task (Analysis-Outcome 'stopped 'cancelled))
+        (clear! pool slot)]
+       [(list 'result (? boolean? success?) data)
+        #:when (eq? (Place-Task-kind task) 'check-syntax)
+        (if (Place-Task-active? task)
+            (start-local! pool slot task
+                          (lambda () ((Place-Task-restorer task)
+                                      (Place-Task-snapshot task) success? data))
+                          'restoring)
+            (clear! pool slot))]
+       [(list 'result (? list? data))
+        #:when (eq? (Place-Task-kind task) 'resyntax)
+        (if (Place-Task-active? task)
+            (start-local! pool slot task (lambda () (map jsexpr->Resyntax-Result data)) 'restoring)
+            (clear! pool slot))]
+       [_ (raise-protocol-error "result does not match task kind")])]
+    [(list 'init-failure (? string? detail))
+     (unless (and task (eq? (Slot-phase slot) 'preparing))
+       (raise-protocol-error "unexpected initialization failure"))
+     (fail-slot! pool slot (failed detail))]
+    [_ (raise-protocol-error "invalid worker reply")]))
+
+(define (handle-wire-message! pool slot reply)
+  (with-handlers ([exn:fail:place-protocol?
+                   (lambda (reason) (fail-slot! pool slot (failed reason)))])
+    (define task (Slot-task slot))
+    (when (and task (Place-Task-active? task)
+               (>= (current-deadline-milliseconds) (Place-Task-deadline task)))
+      ;; A terminal reply already proves worker cleanup. Settle expiry without
+      ;; sending an obsolete cancel; `wire!` still validates the reply.
+      (settle! pool task (failed 'analysis-timeout)))
+    (wire! pool slot reply)))
+
+(define (handle-worker-death! pool slot)
+  (define worker (Slot-worker slot))
+  (set-Worker-dead?! worker #t)
+  ;; A queued terminal reply wins over death. A dead place is never reused.
+  (define reply (sync/timeout 0 (Worker-place worker)))
+  (when reply
+    (with-handlers ([exn:fail:place-protocol? void]) (wire! pool slot reply)))
+  ;; Transferred data and parent custody no longer depend on the place. Keep
+  ;; the reservation through parent cleanup, then clear! retires its worker.
+  (unless (memq (Slot-phase slot) '(restoring cleaning))
+    (fail-slot! pool slot (failed 'worker-exited))))
+
+(define (slot-events slot)
+  (define worker (Slot-worker slot))
+  (append
+    ;; Death events remain ready forever. Skip observed death during parent
+    ;; work, and all worker events during retirement, so this sync cannot spin.
+    (if (and worker (not (Worker-dead? worker)) (not (eq? (Slot-phase slot) 'retiring)))
+        (Worker-events worker) '())
+    (if (Slot-async slot) (list (Async-Task-event (Slot-async slot))) '())))
+
+(define (check-deadlines! pool)
+  (define now (current-deadline-milliseconds))
+  (for ([task (in-list (hash-keys (Pool-tasks pool)))]
+        #:when (>= now (Place-Task-deadline task)))
+    (cancel! pool task (failed 'analysis-timeout)))
+  (for ([slot (in-list (Pool-slots pool))]
+        #:when (and (Slot-until slot) (>= now (Slot-until slot))))
+    (fail-slot! pool slot (failed 'worker-watchdog))))
+
+(define (sync-pool-events pool)
+  (define deadlines
+    (append (map Place-Task-deadline (hash-keys (Pool-tasks pool)))
+            (filter-map Slot-until (Pool-slots pool))))
+  (define events
+    (append (list (Pool-command-event pool))
+            (if (pair? deadlines)
+                (list (handle-evt (deadline-evt (apply min deadlines)) (lambda (_) '(timer))))
+                '())
+            (append-map slot-events (Pool-slots pool))))
+  (apply sync events))
+
+(define (handle-command! pool command)
+  (match command
+    [(list 'submit task)
+     (hash-set! (Pool-tasks pool) task #t)
+     (enqueue! (Pool-queue pool) task)]
+    [(list 'cancel task) (cancel! pool task (Analysis-Outcome 'stopped 'cancelled))]
+    [(list 'stop)
+     (set-Pool-stopped?! pool #t)
+     (for ([task (in-list (hash-keys (Pool-tasks pool)))])
+       (settle! pool task (Analysis-Outcome 'stopped 'shutdown)))
+     (queue-filter! (Pool-queue pool) (lambda (_) #f))
+     (for ([slot (in-list (Pool-slots pool))] #:unless (eq? (Slot-phase slot) 'empty))
+       (retire! pool slot))]))
+
+(define (run-pool-manager pool)
+  (let loop ()
+    ;; Timers precede assignment, even when another event won the previous sync.
+    (check-deadlines! pool)
+    (unless (Pool-stopped? pool) (assign-queued! pool))
+    (unless (and (Pool-stopped? pool)
+                 (andmap (lambda (slot) (eq? (Slot-phase slot) 'empty)) (Pool-slots pool)))
+      (match (sync-pool-events pool)
+        [(list 'command command) (handle-command! pool command)]
+        [(list 'wire slot reply) (handle-wire-message! pool slot reply)]
+        [(list 'dead slot) (handle-worker-death! pool slot)]
+        [(list 'async finish) (finish)]
+        ['(timer) (void)])
+      (loop))))

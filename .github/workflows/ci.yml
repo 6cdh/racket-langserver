@@ -56,7 +56,7 @@ jobs:
       - name: Install Resyntax
         run: raco pkg install --no-docs --auto resyntax
       - name: Running resyntax tests
-        run: raco test tests/textDocument/resyntax/
+        run: raco test tests/resyntax/
 
   fmt:
     name: "fmt integration on stable Racket"

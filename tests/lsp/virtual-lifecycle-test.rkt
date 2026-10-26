@@ -29,7 +29,8 @@
     (define previous (source-controller-view controller source))
     (define old-snapshot (source-controller-snapshot controller source))
     (define waiting (start-analysis controller source))
-    (define late-message (await (source-controller-events controller)))
+    ;; This wait includes cold worker initialization under parallel test load.
+    (define late-message (await (source-controller-events controller) 30))
     (source-controller-close! controller source old)
     (check-not-false (sync/timeout 0 (Source-View-changed previous)))
     (check-false (source-controller-view controller source))

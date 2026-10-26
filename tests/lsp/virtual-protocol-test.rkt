@@ -82,7 +82,8 @@
                   (lambda (session)
                     (open! session uri "(define value 1)\nvalue\n")
                     (barrier session)
-                    (await (acquire session source))
+                    ;; Include cold initialization, independent of command responsiveness.
+                    (await (acquire session source) 30)
                     (define diagnostics (analysis-diagnostics session))
                     (check-not-false
                       (for/or ([diag (in-list diagnostics)])
@@ -111,7 +112,9 @@
           (lambda (session)
             (open! session uri text)
             (barrier session)
-            (check-eq? 'succeeded (Analysis-Outcome-state (await (acquire session source))))
+            ;; Cold Check Syntax loads Doc, including its optional Resyntax
+            ;; imports, before this injected Resyntax task runs.
+            (check-eq? 'succeeded (Analysis-Outcome-state (await (acquire session source) 30)))
             (check-equal? (await starts) (list text uri))
             (analysis-diagnostics session) ; Check Syntax publication
             (check-equal? (length (analysis-diagnostics session)) 1) ; Resyntax publication

@@ -17,7 +17,6 @@
          "../../workspace/current.rkt"
          "../analysis.rkt"
          "../safedoc.rkt"
-         "../resyntax-place.rkt"
          "analysis-scheduler.rkt"
          "analysis-publisher.rkt"
          "closed-analysis-cache.rkt"
@@ -34,7 +33,7 @@
          source-controller-acquire-analysis!
          source-controller-current-view?
          source-controller-handle-completion!
-         source-controller-pump!
+         source-controller-cancel-ineligible-analysis!
          source-controller-open!
          source-controller-edit!
          source-controller-close!
@@ -85,20 +84,20 @@
 
 ;; Timeouts are seconds. The workspace supplies publication only, not session
 ;; isolation for request-layer workspace access. Zero cache capacity disables
-;; closed-file retention; #f Resyntax disables its follow-on work.
+;; closed-file retention. `#f` Resyntax disables its follow-on work.
 (define (make-source-controller #:workspace [workspace current-workspace]
                                 #:read [read read-source-text]
                                 #:read-timeout [read-timeout 3]
-                                ;; #f selects this session's Check Syntax pool;
-                                ;; a procedure injects a test analyzer in a supervised thread.
+                                ;; `#f` selects production Check Syntax through the shared
+                                ;; pool; a procedure injects a pool task under its task custodian.
                                 #:analyze [analyze #f]
                                 #:analysis-slots [slots 4]
                                 #:analysis-timeout [analysis-timeout 90]
-                                ;; Wraps Check Syntax place creation. Stdio `main-loop` supplies
+                                ;; Wraps shared-pool place creation. Stdio `main-loop` supplies
                                 ;; a reader-pausing guard; the default calls `thunk` unchanged.
                                 #:place-start-guard [place-start-guard (lambda (thunk) (thunk))]
                                 #:closed-analysis-limit [closed-analysis-limit 64]
-                                #:resyntax [resyntax (and (resyntax-available?) run-resyntax/in-place)])
+                                #:resyntax [resyntax (and (resyntax-available?) 'place)])
   (define events (make-async-channel))
   (Source-Controller (make-source-store) events (make-semaphore 0)
                      (make-disk-reader events #:read read #:timeout read-timeout)
@@ -166,9 +165,9 @@
 (define (source-controller-current-view? controller view)
   (eq? view (source-controller-view controller (Source-View-source view))))
 
-(define (source-controller-pump! controller)
-  (pump-analysis-scheduler! (Source-Controller-scheduler controller)
-                            (lambda (snapshot) (snapshot-current? controller snapshot))))
+(define (source-controller-cancel-ineligible-analysis! controller)
+  (cancel-ineligible-analysis! (Source-Controller-scheduler controller)
+                               (lambda (snapshot) (snapshot-current? controller snapshot))))
 
 (define (source-controller-observe! controller source)
   (match (source-controller-view controller source)
@@ -222,7 +221,7 @@
      (define buffer (source-buffer controller source))
      (when buffer
        (with-write-safedoc buffer (lambda (sd) (set-SafeDoc-analysis-completion! sd event))))
-     (source-controller-pump! controller)
+     (source-controller-cancel-ineligible-analysis! controller)
      event]))
 
 (define (source-controller-acquire-analysis! controller snapshot)
@@ -272,7 +271,7 @@
       (cond
         [(not (snapshot-current? controller snapshot)) (Analysis-Outcome 'stopped 'source-changed)]
         [(Analysis-Outcome? result) result]
-        [(eq? kind 'analysis) (record-analysis! controller snapshot result completion)]
+        [(eq? kind 'check-syntax) (record-analysis! controller snapshot result completion)]
         [else
          (define buffer (source-buffer controller source))
          (when buffer
@@ -282,7 +281,7 @@
          (Analysis-Outcome 'succeeded #f)])))
   (define succeeded? (eq? 'succeeded (Analysis-Outcome-state outcome)))
   (case kind
-    [(analysis)
+    [(check-syntax)
      (unless succeeded? (discard-analysis! controller source))
      (when (and succeeded? (source-buffer controller source) (get-resyntax-enabled))
        (schedule-resyntax! (Source-Controller-scheduler controller) snapshot completion))]
@@ -366,8 +365,9 @@
   (cancel-source-analysis! (Source-Controller-scheduler controller) source)
   (withdraw-document-analysis! (Source-Controller-publisher controller) source uri)
   (cancel-read! controller source)
-  ;; Invalidation freed slots; start queued attempts for other sources.
-  (source-controller-pump! controller))
+  ;; This source's pool tasks were cancelled above. Sweep other sources whose
+  ;; snapshots this close made obsolete.
+  (source-controller-cancel-ineligible-analysis! controller))
 
 ;; Files only. Drop retained data and cached disk text. An open buffer keeps
 ;; its document, gets a new revision, and is re-analyzed. A file without a
@@ -386,11 +386,12 @@
     (cancel-source-analysis! (Source-Controller-scheduler controller) source)
     (cancel-read! controller source)
     (when buffer (source-controller-refresh-analysis! controller source))
-    ;; Invalidation freed slots; start queued attempts for other sources.
-    (source-controller-pump! controller)))
+    ;; This source's obsolete pool tasks were cancelled above. Sweep other
+    ;; sources whose snapshots this invalidation made obsolete.
+    (source-controller-cancel-ineligible-analysis! controller)))
 
-;; Subsystems settle their own pending work; shutdown does not inspect tables,
-;; queues, lanes, attempts, workers, or completion-event representations.
+;; Subsystems settle their own pending work. Shutdown does not inspect tables,
+;; queues, attempts, workers, or completion-event representations.
 (define (source-controller-shutdown! controller)
   (unless (source-controller-stopped? controller)
     (semaphore-post (Source-Controller-shutdown controller))

@@ -1,6 +1,6 @@
 #lang racket
 
-(require "../../../common/dynamic-import.rkt")
+(require (only-in "../../doclib/external/resyntax.rkt" resyntax-available?))
 
 (define uri "file:///test.rkt")
 
@@ -12,19 +12,15 @@
 END
   )
 
-;; detect if resyntax is available
-(define has-resyntax? #t)
-(dynamic-imports ('resyntax
-                   resyntax-analyze)
-                 (λ () (set! has-resyntax? #f)))
+(define has-resyntax? (resyntax-available?))
 
 (module+ test
   (require rackunit
            json
-           "../with-document.rkt"
-           (only-in "../../client.rkt" with-racket-lsp)
-           "../../../common/settings.rkt"
-           "../../../common/json-util.rkt")
+           "../textDocument/with-document.rkt"
+           (only-in "../client.rkt" with-racket-lsp)
+           "../../common/settings.rkt"
+           "../../common/json-util.rkt")
 
   (when has-resyntax?
     (with-racket-lsp

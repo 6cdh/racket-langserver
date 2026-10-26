@@ -1,11 +1,15 @@
 #lang racket/base
 
-(provide run-resyntax
-         resyntax-available?)
-
 (require "../../common/dynamic-import.rkt"
          "../../common/interfaces.rkt")
 
+(provide run-resyntax
+         resyntax-available?)
+
+;; Bind the optional API once when this module loads, including when Doc imports
+;; it during Check Syntax. Any failed import logs and disables the adapter;
+;; callers inspect the cached flag instead of handling import exceptions.
+;; Failed bindings are never called after the flag is cleared.
 (define has-resyntax? #t)
 
 (define (resyntax-available?)
@@ -14,26 +18,20 @@
 (define (disable-resyntax!)
   (set! has-resyntax? #f))
 
-(dynamic-imports ('resyntax/grimoire/source
-                   string-source
-                   source->string)
-                 ('resyntax/grimoire/string-replacement
-                   string-replacement-start
-                   string-replacement-original-end
-                   string-replacement-new-text)
-                 ('resyntax/private/refactoring-result
-                   refactoring-result-string-replacement
-                   refactoring-result-message
-                   refactoring-result-rule-name
-                   refactoring-result-set-results)
-                 ('resyntax
-                   resyntax-analyze)
-                 disable-resyntax!)
+(dynamic-imports
+  ('resyntax/grimoire/source string-source source->string)
+  ('resyntax/grimoire/string-replacement
+    string-replacement-start string-replacement-original-end string-replacement-new-text)
+  ('resyntax/private/refactoring-result
+    refactoring-result-string-replacement refactoring-result-message
+    refactoring-result-rule-name refactoring-result-set-results)
+  ('resyntax resyntax-analyze)
+  #:fail disable-resyntax!)
 
 (define (run-resyntax text _src)
   (if has-resyntax?
       (run-resyntax-impl text)
-      (list)))
+      '()))
 
 (define (run-resyntax-impl text)
   (define text-source (string-source text))

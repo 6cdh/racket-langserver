@@ -7,14 +7,14 @@
 
 (module+ test
   (test-case
-    "existing helpers and optional imports share the server logger"
+    "debug helpers and handled optional imports share the server logger"
     (define logs '())
     (with-intercepted-logging
       (lambda (event) (set! logs (cons event logs)))
       (lambda ()
         (maybe-debug-log '(incoming message))
         (let ()
-          (dynamic-imports ('racket/base missing-binding-for-logging-test) void)
+          (dynamic-imports ('racket/base missing-binding-for-logging-test) #:fail void)
           (check-true (void? missing-binding-for-logging-test)))
         (check-equal? (call-with-values (lambda () (D (values 1 2))) list) '(1 2))
         (check-equal? (call-with-values (lambda () (T (values 3 4))) list) '(3 4)))
@@ -46,3 +46,16 @@
     (check-equal? (length expansion-logs) 1)
     (check-eq? (vector-ref (car expansion-logs) 2) payload)
     (check-equal? (vector-ref (car expansion-logs) 3) 'online-check-syntax)))
+
+(module+ test
+  (test-case "an optional import's fail thunk runs once even when it raises"
+    (define failures 0)
+    (check-exn
+      #rx"requested failure"
+      (lambda ()
+        (dynamic-imports ('racket/base missing-binding-for-failure-test)
+                         #:fail (lambda ()
+                                  (set! failures (add1 failures))
+                                  (error 'optional-import "requested failure")))
+        (void)))
+    (check-equal? failures 1)))

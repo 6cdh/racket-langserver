@@ -1,5 +1,9 @@
 #lang racket/base
 
+;; Same-revision sharing, pool FIFO ordering through submission, and
+;; acceptance before completion. Injected analysis uses the pool contract
+;; without a second queue.
+
 (module+ test
   (require rackunit
            racket/async-channel
@@ -41,7 +45,7 @@
         (custodian-shutdown-all custodian))))
 
   (define (accept-success snapshot kind completion parent product)
-    (check-eq? kind 'analysis)
+    (check-eq? kind 'check-syntax)
     (check-false parent)
     (check-false (evt-ready? completion))
     (check-true (Analysis-Product-succeeded? product))
@@ -55,14 +59,14 @@
         (define first (request-analysis! scheduler a))
         (define second (request-analysis! scheduler b))
         (check-eq? first (request-analysis! scheduler a))
-        (pump-analysis-scheduler! scheduler (lambda (_) #t))
+        (cancel-ineligible-analysis! scheduler (lambda (_) #t))
         (check-eq? (await started) a)
         (check-false (sync/timeout 0 started))
         (async-channel-put release #t)
         (finish-analysis-task! scheduler (await events) accept-success)
         (check-eq? (Analysis-Outcome-state (await first)) 'succeeded)
         (check-false (scheduled-analysis-event scheduler (Source-Snapshot-source a)))
-        (pump-analysis-scheduler! scheduler (lambda (_) #t))
+        (cancel-ineligible-analysis! scheduler (lambda (_) #t))
         (check-eq? (await started) b)
         (async-channel-put release #t)
         (finish-analysis-task! scheduler (await events) accept-success)
@@ -73,7 +77,7 @@
       (lambda (scheduler events started release)
         (define a (snapshot "schedule-retry.rkt"))
         (define first (request-analysis! scheduler a))
-        (pump-analysis-scheduler! scheduler (lambda (_) #t))
+        (cancel-ineligible-analysis! scheduler (lambda (_) #t))
         (await started)
         (async-channel-put release #t)
         (define old (await events))
@@ -83,7 +87,7 @@
         (check-eq? (Analysis-Outcome-state (await first)) 'failed)
         (define retry (request-analysis! scheduler a))
         (check-not-eq? first retry)
-        (pump-analysis-scheduler! scheduler (lambda (_) #t))
+        (cancel-ineligible-analysis! scheduler (lambda (_) #t))
         (await started)
         (finish-analysis-task! scheduler old (lambda args (error 'stale "old result accepted")))
         (check-false (evt-ready? retry))
@@ -94,12 +98,16 @@
   (test-case "queued stale work is settled without starting and shutdown resolves queued work"
     (with-scheduler
       (lambda (scheduler _events started _release)
-        (define a (snapshot "schedule-stale.rkt"))
-        (define stale (request-analysis! scheduler a))
-        (pump-analysis-scheduler! scheduler (lambda (_) #f))
+        (define a (snapshot "schedule-held.rkt"))
+        (define first (request-analysis! scheduler a))
+        (await started)
+        (define b (snapshot "schedule-stale.rkt"))
+        (define stale (request-analysis! scheduler b))
+        (cancel-ineligible-analysis! scheduler (lambda (input) (eq? input a)))
         (check-eq? (Analysis-Outcome-state (await stale)) 'stopped)
         (check-false (sync/timeout 0 started))
-        (define queued (request-analysis! scheduler a))
+        (define queued (request-analysis! scheduler b))
         (stop-analysis-scheduler! scheduler)
+        (check-eq? (Analysis-Outcome-state (await first)) 'stopped)
         (check-eq? (Analysis-Outcome-state (await queued)) 'stopped)
-        (check-eq? (Analysis-Outcome-state (await (request-analysis! scheduler a))) 'stopped)))))
+        (check-eq? (Analysis-Outcome-state (await (request-analysis! scheduler b))) 'stopped)))))

@@ -118,16 +118,22 @@ session; the request layer must use that same workspace.
 - `source-controller.rkt`: request-thread commands and consumer dispatch
 - `source-controller/source-owner.rkt`: ownership, acceptance, and lifecycle
 - `workspace/source-store.rkt`: source authority, revisions, and change signals
-- `disk-reader.rkt`: ordered per-source disk reads and shared waiters
-- `analysis-scheduler.rkt`: shared attempts, FIFO dispatch, capacity, and
-  completion
-- `place-runner.rkt`: session-owned Check Syntax place pool
-- `../analysis-place.rkt`: per-job analysis namespace inside a place
-- `supervised-worker.rkt`: disk reads, Resyntax, and injected analyzers
-- `analysis-publisher.rkt`: installation, diagnostics, and Resyntax
-  publication; buffer operations require the controller-held SafeDoc write lock
-- `closed-analysis-cache.rkt`: completed analysis while files are closed
-- `completion-event.rkt`: single-owner first-value broadcast, including `#f`
+- `source-controller/disk-reader.rkt`: ordered per-source disk reads and shared
+  waiters
+- `source-controller/analysis-scheduler.rkt`: shared source attempts, acceptance,
+  and completion
+- `source-controller/place-runner.rkt`: shared FIFO, deadlines, slots,
+  restoration, and recovery
+- `analysis-place.rkt`: persistent control loop and per-job threads for both
+  task kinds
+- `source-controller/supervised-worker.rkt`: independent disk-read supervision
+- `source-controller/analysis-publisher.rkt`: installation, diagnostics, and
+  Resyntax publication; buffer operations require the controller-held SafeDoc
+  write lock
+- `source-controller/closed-analysis-cache.rkt`: completed analysis while files
+  are closed
+- `source-controller/completion-event.rkt`: single-owner first-value broadcast,
+  including `#f`
 
 ## Acceptance
 
@@ -146,48 +152,64 @@ request commands and not a callback registry.
   executor products, installs or discards analysis, and translates acceptance
   failures to terminal outcomes. The scheduler removes the attempt and
   resolves its event only after acceptance returns. Successful open-buffer
-  analysis may enqueue Resyntax during acceptance; dispatch occurs after the
-  command finishes.
+  analysis may submit Resyntax during acceptance. Its worker may start before
+  acceptance returns, but its result can only be accepted by a later owner event.
 
-Source replacement cancels affected work. The scheduler also checks queued
-snapshot eligibility immediately before launch. Availability lookup and reuse
-of completed success belong to the controller, not the scheduler.
+Source replacement immediately revokes acceptance and cancels affected pool
+tasks. Availability lookup and reuse of completed success belong to the
+controller, not the scheduler.
 
 `supervised-worker.rkt` suppresses worker stdout and releases resources before
 reporting a result. Cancelling work does not kill its supervisor; a late
-message is rejected by the reader or scheduler.
+message is rejected by the reader.
 
 ## Place execution
 
-Production Check Syntax uses a session-owned pool of reusable places, created
-lazily up to `#:analysis-slots` (four by default), with hard cancellation and
-supervised restoration. The scheduler is the only FIFO job queue and limits
-combined Check Syntax and Resyntax attempts to that capacity. Resyntax uses
-its separate executor and shares that bound.
+Check Syntax and Resyntax share one session-owned pool. The manager is an
+ordinary thread. It owns the only FIFO, absolute deadlines, a fixed number of
+slots (`#:analysis-slots`, four by default), and recovery. The analysis
+scheduler (`source-controller/analysis-scheduler.rkt`) submits tasks, cancels
+their handles, and accepts outcomes. It does not know worker identities,
+availability, or retirement counts.
 
-Each pool slot holds at most one place and stays reserved through parent
-restoration or observed place retirement. Idle workers cannot cause extra
-restoration work to bypass the shared attempt bound.
+Each slot holds at most one place and stays reserved through native startup,
+library initialization, execution, transfer, parent restoration, and cleanup.
+With N slots, at most N tasks execute or restore and at most N places exist.
+A dead worker stays reserved through parent cleanup, then retires without
+becoming idle. Places start lazily. Idle places stay warm. Either task kind
+may be a worker's first assignment.
 
-`#:analyze #f` selects the session's place runner. Ordinary-thread Check Syntax
-is no longer a production export: `analyze-source` lives in `analysis.rkt`'s
-`test-support` submodule for equivalence checks and the benchmark baseline.
-`#:analyze` still accepts a procedure as a deterministic test seam, supervised
-with the same attempt deadline. Production Resyntax and disk reads keep
-ordinary-thread supervision.
+`#:analyze #f` selects production Check Syntax. `analyze-source` remains in
+`analysis.rkt`'s `test-support` submodule for reference collection and the
+ordinary-thread benchmark. Injected analyzers and Resyntax procedures use the
+same submission, deadline, cancellation, and reservation contract, and run
+locally under a task custodian. They do not create a second queue. Disk
+readers keep independent supervision.
 
-The FIFO scheduler reserves a slot before launch. Its 90-second default
-deadline includes startup, collection, serialization, transfer, local document
-construction, and restoration. Queue waiting is outside the deadline. Worker
-stdout is suppressed from startup, including language loading and extraction.
+Each submission captures one absolute monotonic deadline, 90 seconds by
+default. That budget includes FIFO waiting, startup, initialization,
+execution, serialization, transfer, and restoration. It does not reset when
+the task changes phase. Queued work expires even while every slot is occupied.
+Same-revision callers share the existing attempt and deadline. The pool checks
+activity and deadline before consuming a result. The analysis scheduler checks
+the deadline again immediately before acceptance, so a completion delayed in the
+consumer queue cannot install after expiry. Installation and publication
+remain one short owner operation before shared completion becomes ready.
+Resyntax is a separate submission after accepted Check Syntax, with its own
+budget.
+
+Worker stdout is suppressed from native startup onward. Pool construction
+captures the worker factory, startup guard, watchdog durations, and parent
+cleanup procedure. A task captures its restoration procedure at submission.
+Changing the factory around submission does not change a pool's workers.
 
 ### Place creation and the stdin reader
 
 Racket CS 9.3 can lose a scheduled-thread count when place creation overlaps
-input readiness. The scheduler then undercounts runnable threads, so the
+input readiness. The runtime then undercounts runnable threads, so the
 stdin reader never runs and a stdio session hangs.
 
-`main-loop` wraps Check Syntax `dynamic-place*` with
+`main-loop` wraps shared-pool `dynamic-place*` with
 `make-reader-place-start-guard` on this process's stdin reader. The guard
 suspends that reader for the native create call and resumes it when creation
 returns, including when creation raises. Non-stdio controllers keep the
@@ -200,49 +222,91 @@ creation is unchanged.
 
 ### Cancellation and reservation
 
-The runner retains its reservation through restoration.
+Logical settlement and physical capacity release are separate manager events.
+Cancellation callers never wait for cleanup. Source changes revoke acceptance
+immediately, independently of messages already queued for the controller.
 
-- Cancelling queued work has no worker effect.
-- Cancelling running place work signals its bridge. The consumer never waits
-  for termination. The bridge kills and observes the place before releasing
-  physical capacity and sending its terminal message.
-- The scheduler counts cancelled place reservations against the shared bound
-  until it consumes that message, including when dispatching Resyntax.
-- When only parent restoration remains, cancellation stops that task and
-  preserves the cleaned worker.
-- A successful assignment returns its place for reuse.
-- Logical settlement only removes the attempt and resolves its event.
-  Cancellation separately stops its worker.
-- Each cancellation handle belongs to one assignment and cannot kill a newer
-  job.
+- Queued cancellation or expiry settles the task and removes it from the FIFO.
+- Startup or library initialization settles the task, keeps the startup and
+  its original watchdog, and never starts the obsolete task. A newly ready
+  worker stays available for later work.
+- Execution settles the task and sends its unique job ID. The slot stays
+  reserved until cleanup acknowledgment.
+- Parent restoration stops and cleans that task while preserving the worker.
+  The slot stays reserved through parent cleanup.
+- Already terminal handles have no effect, including after slot reuse.
 
-Shutdown prevents new dispatch and asynchronously retires both active and idle
-places. Bridges and retirement threads share the runner's owning custodian, so
-disposing the consumer's custodian cannot interrupt cleanup of its places.
+### Worker jobs and initialization
+
+The worker control thread stays outside job custody. Each invocation gets a
+new job thread and child custodian. Only the control thread sends terminal
+success, failure, or cancellation, and only after it has cleaned resources
+and dropped job references. Job threads never send those replies. Job death
+first polls for a queued outcome; without one, it cleans and reports failure.
+
+Library initialization uses a separate persistent lifetime. Readiness is
+reported after the adapter loads. Unhandled initialization errors fail the
+assignment and retire the worker.
+
+The Resyntax adapter binds its optional imports when that module loads,
+including when Doc imports it for Check Syntax. Import failures log and clear
+a cached availability flag; they do not escape to ordinary callers.
+`resyntax-available?` reads that flag, and `run-resyntax` returns no findings
+when disabled. That covers an absent package and errors or missing exports in
+an installed stack. Those handled failures disable Resyntax without retiring
+an otherwise responsive worker. Errors while running an available analyzer
+still follow the ordinary job-failure path.
+
+### Watchdogs
+
+Cancellation acknowledgment waits one second. Native startup and the first
+library initialization share one 90-second watchdog, armed at dispatch and not
+renewed when the place is created. Initializing another task kind on an
+existing worker gets a new 90-second watchdog. These are operational defaults,
+not measured bounds. Repeated cancellation does not restart the startup
+watchdog or the cleanup-acknowledgment timer.
+A stalled worker is killed and observed terminated before its slot becomes
+free. Replacement is lazy. Jobs are never retried automatically.
+
+### Shutdown
+
+Shutdown stops admission and dispatch, settles outstanding tasks, stops parent
+work, and retires starting, active, and idle workers. The pool's internal
+`place-runner-shutdown-evt` becomes ready after the manager exits and every
+reservation is released. Submission and stop are serialized at the runner
+boundary: no command is admitted behind stop. Later submissions receive a
+stopped outcome without keeping a manager thread alive. The controller's
+existing shutdown event still signals logical shutdown. Cleanup helpers remain
+under the pool's owning session lifetime.
 
 ### Replies and reuse
 
-Replies contain a job ID, success plus the completed trace, or normalized
-failure text. Job IDs increase across all slots and replacements within the
-runner. Each reply is read from its assigned place channel.
+The wire carries preparation and readiness, start, cancellation, and terminal
+messages. Every job command and terminal reply carries a unique assignment ID.
+The manager reads messages from the assigned physical worker and validates that
+ID, so an obsolete result or cancel cannot affect a later task.
 
-- Read and expansion errors remain completed products with diagnostics.
-- Unexpected execution, serialization, protocol, and restoration errors fail
-  the attempt.
-- A worker failure reply retires the place even after job cleanup: the
-  exception may have left place-wide state inconsistent.
-- A parent restoration failure preserves the worker that returned a normal
-  result.
-- A reply queued alongside worker death is considered before reporting
-  premature exit.
-- Cancelled attempts cannot accept late replies. Source revision is checked
-  again at acceptance before installation, publication, and shared completion.
+- Reader and expansion errors remain completed Check Syntax products with
+  diagnostics.
+- A caught job exception with completed cleanup fails its task and keeps the
+  worker.
+- Parent restoration errors fail their task and keep the cleaned worker.
+- Worker death, initialization failure, malformed protocol, or unacknowledged
+  cancellation retires the worker. A queued terminal reply is inspected before
+  reporting premature death. After valid transfer, parent restoration and
+  cleanup may finish independently before retirement; a dead worker is never
+  reused.
+- Once cancellation or expiry settles a task, later results are discarded.
+  Capacity still requires cleanup acknowledgment or observed retirement.
 
 The parent restores the completed trace and derives its product without
-repeating Check Syntax. The worker loop in `analysis-place.rkt` gives each job
-a fresh analysis namespace and custodian and cleans up before replying. Trace
-conversion and fidelity live in `doclib/doc-trace.rkt` and
-`tests/lib/trace-place-test.rkt`.
+repeating Check Syntax. Conversion and fidelity live in `doclib/doc-trace.rkt`
+and `tests/lib/trace-place-test.rkt`. The worker's persistent-state audit and
+limits are beside its adapters in `analysis-place.rkt`. Fresh namespaces and
+job custodians do not roll back arbitrary reader, macro, library-cache, or
+native mutations. Interrupted real Check Syntax and installed Resyntax tests
+establish specific cleanup and reuse cases, not universal transactional
+isolation.
 
 ## Available results and fresh completion
 
@@ -252,7 +316,7 @@ joined: a newly scheduled attempt, or a reused completed success's event.
 Available analysis may answer queries while that event is pending. Restoring a
 product never completes that event or starts Resyntax.
 
-Only queued and running attempts occupy the scheduler's private attempt table.
+Only active attempts occupy the analysis scheduler's private attempt table.
 Every terminal attempt is removed. An accepted available result retains its
 completion event, so repeated acquisitions can reuse success without retaining
 the job. Resyntax acceptance compares its parent completion with the installed
@@ -307,30 +371,35 @@ stops work and clears retention.
 
 ## Capacity
 
-[The benchmark and measured results](../bench/place-runner-results.md) compare
-one, two, and four slots with the ordinary-thread test baseline. They cover
-cold and warm batches, fresh and warm rapid-edit sessions, controller command
-latency, resident memory, and isolated conversion and transport probes. The
-report defines their boundaries: controller command latency is not full LSP
-request latency, and companion phase samples do not decompose production batch
-totals.
+Keep four slots and lazy startup. Do not add prewarming, priority scheduling,
+or automatic retry. Normal cancellation preserves the executing place after
+job cleanup.
 
-Keep the four-slot default and lazy startup. The measured warm heavy batch
-benefits from four places, while first use and resident memory cost more than
-ordinary threads. These workload-specific samples do not establish a better
-universal capacity or justify allocating warm workers before demand. Hard
-cancellation still discards the executing place, so repeated cancellation can
-lose reuse. This migration does not add prewarming, caching, payload
-optimization, or cooperative recovery.
+The [shared-pool measurements](../bench/shared-place-pool-results.md) record
+rapid-edit latency and worker-creation counts for this executor, including
+slower samples. They do not establish a general latency improvement. The
+archived [place-runner measurements](../bench/place-runner-results.md)
+compared one, two, and four slots with an ordinary-thread baseline. Those
+samples showed a warm heavy-batch benefit at four places, and higher first-use
+and resident-memory cost than ordinary threads. They do not justify a
+different default or allocating workers before demand. Controller command
+latency in those reports is not full LSP request latency.
 
 ## Verification
 
 Production-path tests use the session consumer and named commands or LSP
 messages. Tests that must order individual transitions or replay delayed
 worker messages own an isolated controller on the test thread and call the
-same owner operations. Assertions run on the test thread; command failures
+same owner operations. Assertions run on the test thread. Command failures
 are values only where a test explicitly exercises that production contract.
 
-Place-pool obligations live in `tests/lsp/place-runner-test.rkt`. Guard local
-behavior lives in `tests/lib/place-start-guard-test.rkt`; those tests do not
-reproduce the Racket CS hang.
+- `tests/resyntax/place-runner-test.rkt`: pool transitions and fallback, using a
+  controllable real place. Barriers are explicit receipts, not sleeps.
+- `tests/resyntax/shared-worker-test.rkt`: started real jobs, resource cleanup,
+  result/cancel races, and later Check Syntax and Resyntax in the same place.
+  An availability skip does not establish Resyntax integration.
+- `tests/resyntax/resyntax-loading-test.rkt`: eager imports, cached availability,
+  optional-package absence, and logging that disables an installed stack
+  whose imports fail.
+- `tests/lib/place-start-guard-test.rkt`: local guard behavior. Those tests
+  do not reproduce the Racket CS hang.

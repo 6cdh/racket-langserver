@@ -3,6 +3,7 @@
 ;; Public command interface for the source controller. Request threads submit
 ;; named commands and wait; the consumer dispatches them to the private source
 ;; owner. No source state or subsystem handle is exposed here.
+;; Cross-file rules are in analysis-lifecycle.md.
 (require racket/async-channel
          racket/contract
          racket/match
@@ -104,8 +105,9 @@
                            (with-handlers ([(lambda (_) #t) Source-Failure])
                              (proc)))))
 
-;; One dispatch finishes its source transition before queued analysis starts.
-;; Worker completions use the same owner and acceptance ordering as commands.
+;; Source transitions and result acceptance share the consumer. Pool execution
+;; may start independently, including Resyntax submitted during acceptance; its
+;; completion can only be accepted by a later owner event.
 (define (source-controller-handle! controller event)
   (match event
     [(Observe source reply)
@@ -115,4 +117,4 @@
     [(Validate-View view reply)
      (answer! controller reply (lambda () (source-controller-current-view? controller view)))]
     [_ (source-controller-handle-completion! controller event)])
-  (source-controller-pump! controller))
+  (source-controller-cancel-ineligible-analysis! controller))
