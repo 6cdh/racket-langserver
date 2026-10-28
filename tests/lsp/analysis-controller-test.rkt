@@ -149,15 +149,15 @@
   (test-case "analysis publication and close use the injected workspace"
     (define workspace (make-workspace))
     (workspace-add-folder! workspace scratch)
-    (define controller (make-source-controller #:workspace workspace #:resyntax #f))
+    (define controller
+      (make-source-controller #:workspace workspace #:analyze analyze-source #:resyntax #f))
     (define path (build-path scratch "injected-workspace.rkt"))
     (define source (path->source path))
     (define sd (new-safedoc (path->uri path) text 0))
     (source-controller-open! controller source sd)
     (define event (with-read-safedoc sd SafeDoc-analysis-completion))
     (check-true (evt? event) "opening schedules its own analysis")
-    ;; Cold Check Syntax also loads Doc, including its eager optional imports.
-    (source-controller-handle! controller (await (source-controller-events controller) 30))
+    (source-controller-handle! controller (await (source-controller-events controller)))
     (check-eq? 'succeeded (Analysis-Outcome-state (await event)))
     (define definitions
       (with-read-doc sd
@@ -187,12 +187,11 @@
       (dynamic-wind
         (lambda () (workspace-add-folder! current-workspace scratch))
         (lambda ()
-          (with-session (make-source-controller #:resyntax #f)
+          (with-session (make-source-controller #:analyze analyze-source #:resyntax #f)
                         (lambda (session)
                           (open! session uri text 0)
                           (barrier session)
-                          ;; Cold expansion can exceed short coordination waits.
-                          (define result (await (acquire session path) 90))
+                          (define result (await (acquire session path)))
                           (check-eq? 'succeeded (Analysis-Outcome-state result))
                           (check-equal? (hash-ref (Analysis-Summary-definition-ranges (Analysis-Outcome-value result)) binding)
                                         (Range (Pos 1 8) (Pos 1 13)))
@@ -236,7 +235,7 @@
                     (barrier session))))
 
   (test-case "unsuccessful analysis publishes to the opened localhost URI"
-    (with-session (make-source-controller #:resyntax #f)
+    (with-session (make-source-controller #:analyze analyze-source #:resyntax #f)
                   (lambda (session)
                     (open! session localhost-uri "#lang racket/base\n(" 0)
                     (barrier session)
@@ -476,7 +475,7 @@
                   #:request-timeout 0.2))
 
   (test-case "closed analyses retain disk authority and reusable facts without publishing"
-    (with-session (make-source-controller #:read (lambda (_) text))
+    (with-session (make-source-controller #:read (lambda (_) text) #:analyze analyze-source)
                   (lambda (session)
                     (define path (build-path scratch "closed-analysis.rkt"))
                     (await (refresh session path))
@@ -513,7 +512,7 @@
   (test-case "terminal same-revision attempt cannot publish after retry, even with its original product"
     ;; Replay runner messages at the owner boundary. No production response
     ;; thread or worker can mutate the attempt registry.
-    (define controller (make-source-controller #:resyntax #f))
+    (define controller (make-source-controller #:analyze analyze-source #:resyntax #f))
     (define path (build-path scratch "late-attempt.rkt"))
     (define sd (new-safedoc (path->uri path) text 0))
     (define published '())
@@ -577,7 +576,7 @@
 
 (module+ test
   (test-case "delayed completion across edit/close/reopen cannot install or publish"
-    (define controller (make-source-controller #:resyntax #f))
+    (define controller (make-source-controller #:analyze analyze-source #:resyntax #f))
     (define path (build-path scratch "late-incarnation.rkt"))
     (define published '())
     (source-controller-set-notifier! controller
@@ -899,7 +898,7 @@
 
 (module+ test
   (test-case "editing a retired Doc cannot alter the trace transferred into a reopened buffer"
-    (define controller (make-source-controller #:resyntax #f))
+    (define controller (make-source-controller #:analyze analyze-source #:resyntax #f))
     (with-buffer controller (build-path scratch "retired-doc.rkt")
                  (lambda (old source)
                    (drive-controller controller (with-read-safedoc old SafeDoc-analysis-completion))
