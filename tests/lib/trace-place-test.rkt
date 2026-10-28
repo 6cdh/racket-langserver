@@ -73,8 +73,10 @@
   (match-define (list (? boolean? succeeded?) data) (place-result submitted))
   (restore-analysis submitted succeeded? data))
 
-(define (sorted-diags product)
-  (sort (Analysis-Product-diagnostics product) string<? #:key (lambda (d) (hash-ref d 'message))))
+;; Sets and hash tables can enumerate entries differently between places.
+(define (frequencies entries)
+  (for/fold ([counts (hash)]) ([entry (in-list entries)])
+    (hash-update counts entry add1 0)))
 
 ;; Observe every stored feature and declaration relation through service reads.
 ;; Scanning positions also catches a restored map with the right values but
@@ -91,7 +93,7 @@
       (cons range (->jsexpr action)))
     (send trace get-semantic-tokens)
     (send (send trace get-inlay-hints) hints-in-range 0 length)
-    (send decl module-binding-definitions)
+    (frequencies (send decl module-binding-definitions))
     (send decl module-binding-uses)
     (for/list ([pos (in-range length)])
       (list (send decl occurrence-at pos) (send decl definition-at pos)
@@ -103,7 +105,8 @@
 (define (compare-products submitted direct restored)
   (check-equal? (Analysis-Product-succeeded? restored) (Analysis-Product-succeeded? direct))
   (check-equal? (Analysis-Product-summary restored) (Analysis-Product-summary direct))
-  (check-equal? (sorted-diags restored) (sorted-diags direct))
+  (check-equal? (frequencies (Analysis-Product-diagnostics restored))
+                (frequencies (Analysis-Product-diagnostics direct)))
   (check-equal? (Analysis-Product-contribution restored) (Analysis-Product-contribution direct))
   (define original (Analysis-Product-trace direct))
   (define incoming (Analysis-Product-trace restored))
