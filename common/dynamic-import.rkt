@@ -9,9 +9,10 @@
 (define-syntax-rule (import-once mod name fail-thunk)
   (define name
     (with-handlers ([exn:fail?
-                     (lambda (_reason)
+                     (lambda (reason)
                        (log-racket-langserver-info
-                         "symbol '~a' from module '~a' fail to load." 'name mod)
+                         "symbol '~a' from module '~a' failed to load: ~a"
+                         'name mod (exn-message reason))
                        (fail-thunk))])
       (dynamic-require mod 'name))))
 

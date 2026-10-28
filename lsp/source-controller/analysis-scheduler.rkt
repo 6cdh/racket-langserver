@@ -93,7 +93,8 @@
   (and attempt (Analysis-Attempt-completion attempt)))
 
 (define (enqueue! scheduler snapshot kind parent-completion)
-  (define deadline (+ (current-deadline-milliseconds) (* 1000 (Analysis-Scheduler-timeout scheduler))))
+  (define deadline
+    (+ (current-deadline-milliseconds) (* 1000 (Analysis-Scheduler-timeout scheduler))))
   (define attempt
     (Analysis-Attempt snapshot kind parent-completion (make-completion-event) deadline #f))
   (hash-set! (Analysis-Scheduler-attempts scheduler) (attempt-key attempt) attempt)
@@ -134,7 +135,8 @@
   (when (and (not (Analysis-Scheduler-stopped? scheduler))
              (Analysis-Scheduler-resyntax scheduler))
     (define previous
-      (hash-ref (Analysis-Scheduler-attempts scheduler) (cons (Source-Snapshot-id snapshot) 'resyntax) #f))
+      (hash-ref (Analysis-Scheduler-attempts scheduler)
+                (cons (Source-Snapshot-id snapshot) 'resyntax) #f))
     (when previous (cancel-attempt! scheduler previous 'superseded))
     (enqueue! scheduler snapshot 'resyntax parent-completion))
   (void))

@@ -72,6 +72,8 @@
                           '()))))
       'info)
     (check-not-false (ormap (lambda (message) (regexp-match? #rx"resyntax/grimoire/source" message))
+                            logs))
+    (check-not-false (ormap (lambda (message) (regexp-match? #rx"initialization failed" message))
                             logs)))
 
   (test-case "missing exports log and disable the adapter without escaping to callers"

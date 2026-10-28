@@ -31,10 +31,10 @@
       #f)
 
     (define/public (serialize)
-      #f)
+      (error 'serialize "service does not implement serialization"))
 
     (define/public (deserialize! data)
-      (void))
+      (error 'deserialize! "service does not implement deserialization"))
 
     ;; text between start and end (exclusive) was replaced. Sent before
     ;; `expand`/`contract`, in the positions the document had before the edit.

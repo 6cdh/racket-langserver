@@ -50,7 +50,8 @@
         (Hover-Detail-fence-language detail)))
 
 (define (datum->detail data)
-  (match-define (list lines truncated? source-start display-start display-end source-end fence) data)
+  (match-define (list lines truncated? source-start display-start display-end source-end fence)
+    data)
   (Hover-Detail (for/list ([line (in-list lines)]) (apply Hover-Comment-Line line))
                 truncated? source-start display-start display-end source-end fence))
 

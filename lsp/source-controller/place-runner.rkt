@@ -193,14 +193,13 @@
   #:transparent)
 
 (define (make-place-runner #:slots [count 4]
-                           #:place-start-guard [guard (lambda (thunk) (thunk))]
-                           #:place-factory [factory (current-place-factory)])
+                           #:place-start-guard [guard (lambda (thunk) (thunk))])
   (unless (exact-positive-integer? count)
     (raise-argument-error 'make-place-runner "exact-positive-integer?" count))
   (define runner (Place-Runner (make-async-channel) (make-semaphore 1) (make-semaphore 0) #f #f))
   (define pool
     (Pool (for/list ([_ (in-range count)]) (Slot #f #f 'empty #f #f #f #f))
-          (make-queue) (make-hasheq) (current-custodian) guard factory
+          (make-queue) (make-hasheq) (current-custodian) guard (current-place-factory)
           (* 1000 (current-cleanup-seconds)) (* 1000 (current-startup-seconds))
           (current-parent-cleaner)
           (handle-evt (Place-Runner-commands runner) Pool-Command)

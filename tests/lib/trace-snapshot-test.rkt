@@ -8,6 +8,7 @@
          racket/runtime-path
          data/interval-map
          "../../doclib/service/completion.rkt"
+         "../../doclib/service/interface.rkt"
          "../../doclib/service/require.rkt"
          "../../doclib/service/interval-map-snapshot.rkt"
          "../../doclib/internal-types.rkt")
@@ -15,6 +16,12 @@
 (define-runtime-path worker-path "trace-place-worker.rkt")
 
 (module+ test
+  (test-case "a service without serialization methods fails explicitly"
+    (define service (new base-service%))
+    (check-exn #rx"does not implement serialization" (lambda () (send service serialize)))
+    (check-exn #rx"does not implement deserialization"
+               (lambda () (send service deserialize! #f))))
+
   (test-case "completed completion candidates restore and survive edits"
     (define original (new completion%))
     (send original walk-stx (ExpandResult #'unused #'(define-values (λ-name) 1) '()))

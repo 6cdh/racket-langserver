@@ -44,7 +44,7 @@
     (parameterize ([current-custodian custodian] [current-cleanup-seconds 0.15]
                    [current-place-factory factory]
                    [current-analysis-restorer (lambda (_input _success data) data)])
-      (define runner (make-place-runner #:slots slots #:place-factory factory))
+      (define runner (make-place-runner #:slots slots))
       (dynamic-wind
         void
         (lambda () (proc runner events spawned))
@@ -457,7 +457,8 @@
             (check-equal? (length publications) 4)
             (set! pending other-done)
             (run-real-job! control-b)
-            (check-eq? (Analysis-Outcome-state (drive-controller controller other-done 30)) 'succeeded)
+            (check-eq? (Analysis-Outcome-state (drive-controller controller other-done 30))
+                       'succeeded)
             (check-false (sync/timeout 0 spawned))
             (check-false (sync/timeout 0 (place-dead-evt worker-a))))
           (lambda () (source-controller-shutdown! controller))))

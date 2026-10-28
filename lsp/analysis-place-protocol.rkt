@@ -7,8 +7,9 @@
 ;; stay uncontracted.
 ;;
 ;; kind: `'check-syntax` or `'resyntax`.
-;; id: Unique assignment identity, not a slot index. Place-Cancel and
-;;   Place-Terminal whose id is not the active job are ignored.
+;; id: Unique assignment identity, not a slot index. The worker ignores a
+;;   Place-Cancel for another job; the pool treats a mismatched Place-Terminal
+;;   as a protocol failure and retires the worker.
 ;;   Initialization has no job id, so a cancel cannot abort it.
 ;; Place-Prepare / Place-Ready: load `kind` under a persistent worker lifetime.
 ;; Place-Start / Place-Terminal: one job. The terminal is sent only after job

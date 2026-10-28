@@ -213,7 +213,8 @@
             (string-append
               "#lang reader \"reader.rkt\"\n(require \"dep.rkt\" (for-syntax racket/base))\n"
               "(begin-for-syntax\n"
-              " (call-with-output-file ~s (lambda (out) (displayln 'expand out)) #:exists 'append)\n"
+              " (call-with-output-file ~s (lambda (out) (displayln 'expand out)) "
+              "#:exists 'append)\n"
               " (displayln 'expansion-output))\n"
               ";; Documented function.\n(define (f unused) dep)\n(f 1)\n")
             (path->string expand-counter)))
@@ -239,7 +240,8 @@
         (define definition (position-of #rx"f unused"))
         (define use (add1 (position-of #rx"\\(f 1")))
         (define declarations (send trace get-declaration))
-        (check-equal? (send declarations definition-at use) (CharRange definition (add1 definition)))
+        (check-equal? (send declarations definition-at use)
+                      (CharRange definition (add1 definition)))
         (check-equal? (send declarations uses-at definition) (list (CharRange use (add1 use))))
         (check-equal? (Module-Binding-filepath (send declarations module-binding-at use))
                       (source-file-path (Source-Snapshot-source submitted)))
@@ -256,7 +258,8 @@
 
   (test-case "restored document features and hint invalidation"
     (define text
-      "#lang racket/base\n;; A point.\n(struct point (x y))\n(define (f unused) (+ 1 2))\n(f 3)\n(point 4 5)\n")
+      (string-append "#lang racket/base\n;; A point.\n(struct point (x y))\n"
+                     "(define (f unused) (+ 1 2))\n(f 3)\n(point 4 5)\n"))
     (define submitted (snapshot "untitled:Features.rkt" text))
     (define product (restore submitted))
     (define doc (make-source-doc (Source-Snapshot-source submitted) text))

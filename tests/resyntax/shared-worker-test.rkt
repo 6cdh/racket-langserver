@@ -61,7 +61,8 @@
         (define uri (~a "file://" (build-path root "source.rkt")))
         (place-channel-put worker
                            (Place-Start 1 'check-syntax uri
-                                        (~a "#reader (file " (~s (path->string reader)) ")\n") root))
+                                        (~a "#reader (file " (~s (path->string reader)) ")\n")
+                                        root))
         ;; This message is emitted inside read-syntax after child resources exist.
         (check-not-false (sync/timeout 60 listener))
         (define-values (reader-in reader-out) (tcp-accept listener))
