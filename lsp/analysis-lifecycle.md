@@ -204,9 +204,8 @@ Resyntax is a separate submission after accepted Check Syntax, with its own
 budget.
 
 Worker stdout is suppressed from native startup onward. Pool construction
-captures the worker factory, startup guard, watchdog durations, and parent
-cleanup procedure. A task captures its restoration procedure at submission.
-Changing the factory around submission does not change a pool's workers.
+fixes the worker factory, startup guard, watchdog durations, parent cleanup,
+and Check Syntax restoration procedure for the pool's lifetime.
 
 ### Place creation and the stdin reader
 

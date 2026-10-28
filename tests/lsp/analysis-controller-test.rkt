@@ -27,10 +27,12 @@
          "../../lsp/safedoc.rkt"
          "../../lsp/source-controller.rkt"
          (submod "../../lsp/source-controller.rkt" owner)
+         (submod "../../lsp/source-controller.rkt" test-support)
          "../../workspace/api.rkt"
          "../../workspace/current.rkt"
          "../../workspace/source-store.rkt"
          (only-in "../../lsp/source-controller/analysis-scheduler.rkt" Analysis-Completed?)
+         (submod "../../lsp/source-controller/analysis-scheduler.rkt" test-support)
          "controller-support.rkt"
          (submod "../../lsp/source-controller/place-runner.rkt" test-support))
 
@@ -699,18 +701,22 @@
     (dynamic-wind
       (lambda () (set-resyntax-enabled! #t))
       (lambda ()
-        (parameterize ([current-place-factory
-                        (lambda (_guard)
-                          (define worker (dynamic-place shared-peer 'run-peer))
-                          (define-values (control remote) (place-channel))
-                          (place-channel-put worker remote)
-                          (async-channel-put created (cons worker control))
-                          worker)])
+        (let ()
+          (define (factory _guard)
+            (define worker (dynamic-place shared-peer 'run-peer))
+            (define-values (control remote) (place-channel))
+            (place-channel-put worker remote)
+            (async-channel-put created (cons worker control))
+            worker)
           (define probes (make-async-channel))
           (define logs (make-log-receiver racket-langserver-logger 'info))
           (with-session
-            (make-source-controller #:analyze (controlled-analyzer probes) #:resyntax 'place
-                                    #:analysis-slots 1)
+            (make-source-controller/with-scheduler
+              (lambda (events)
+                (make-analysis-scheduler/with-runners
+                  events (make-place-runner/configured #:slots 1 #:factory factory)
+                  (make-place-runner/configured #:slots 1 #:factory factory)
+                  #:analyze (controlled-analyzer probes) #:resyntax 'place)))
             (lambda (session)
               (define path (build-path scratch "actual-resyntax-death.rkt"))
               (open! session path text)

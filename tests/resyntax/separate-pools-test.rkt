@@ -19,6 +19,7 @@
          "../../lsp/source-controller.rkt"
          (submod "../../lsp/source-controller.rkt" owner)
          "../../lsp/source-controller/analysis-scheduler.rkt"
+         (submod "../../lsp/source-controller/analysis-scheduler.rkt" test-support)
          (submod "../../lsp/source-controller/place-runner.rkt" test-support)
          (only-in "../lsp/controller-support.rkt" drive-controller)
          (only-in "../fixtures/analysis-place-peer.rkt" Peer-Preparing))
@@ -38,15 +39,19 @@
   (test-case "both pools create places only on submission and shutdown retires both kinds"
     (define custodian (make-custodian))
     (define created (make-async-channel))
-    (parameterize ([current-custodian custodian]
-                   [current-place-factory
-                    (lambda (guard)
-                      (define worker (guard (lambda () (dynamic-place peer 'run-unready-peer))))
-                      (define-values (control remote) (place-channel))
-                      (place-channel-put worker remote)
-                      (async-channel-put created (cons worker control))
-                      worker)])
-      (define scheduler (make-analysis-scheduler (make-async-channel) #:slots 2 #:resyntax 'place))
+    (define (factory guard)
+      (define worker (guard (lambda () (dynamic-place peer 'run-unready-peer))))
+      (define-values (control remote) (place-channel))
+      (place-channel-put worker remote)
+      (async-channel-put created (cons worker control))
+      worker)
+    (parameterize ([current-custodian custodian])
+      (define scheduler
+        (make-analysis-scheduler/with-runners
+          (make-async-channel)
+          (make-place-runner/configured #:slots 2 #:factory factory)
+          (make-place-runner/configured #:slots 1 #:factory factory)
+          #:resyntax 'place))
       (dynamic-wind
         void
         (lambda ()

@@ -40,17 +40,8 @@
   (close-output-port input)
   worker)
 
-;; Pool construction captures resource dependencies and watchdogs. Restoration
-;; belongs to a submission and captures its submitting thread's parameterization.
-(define current-place-factory (make-parameter spawn-worker))
-(define current-analysis-restorer (make-parameter restore-analysis))
-(define current-cleanup-seconds (make-parameter 1))
-(define current-startup-seconds (make-parameter 90))
-;; The narrow cleanup seam lets tests hold a real reservation through cleanup.
-(define current-parent-cleaner (make-parameter custodian-shutdown-all))
 (module+ test-support
-  (provide current-place-factory current-analysis-restorer
-           current-cleanup-seconds current-startup-seconds current-parent-cleaner))
+  (provide make-place-runner/configured spawn-worker))
 
 ;; Admission boundary for the manager thread.
 ;;
@@ -81,7 +72,6 @@
 ;; done: Caller envelope constructor wrapping the terminal result; never
 ;;   installs source results or publishes.
 ;; work: Optional local test procedure; `#f` selects the fixed place adapter.
-;; restorer: Check Syntax restoration procedure captured at submission.
 ;; active?: Cleared at logical settlement; capacity can remain reserved afterward.
 (struct/contract Place-Task
   ([runner Place-Runner?]
@@ -92,7 +82,6 @@
    [events async-channel?]
    [done (-> any/c any/c)]
    [work (or/c #f (-> any/c))]
-   [restorer (-> Source-Snapshot? boolean? any/c any/c)]
    [(active? #:mutable) boolean?]))
 
 ;; Physical place and its initialized stacks. Independent of the current task.
@@ -147,6 +136,7 @@
 ;; guard / factory: Physical startup captured at construction.
 ;; cleanup-ms / startup-ms: Watchdog durations captured at construction.
 ;; cleaner: Parent-work teardown, also captured at construction.
+;; restorer: Check Syntax result restoration, fixed for this pool.
 ;; serial: Assignment IDs, unique across replacements; not a slot index.
 (struct/contract Pool
   ([slots (listof Slot?)]
@@ -158,6 +148,7 @@
    [cleanup-ms (and/c real? (>=/c 0))]
    [startup-ms (and/c real? (>=/c 0))]
    [cleaner (-> custodian? any)]
+   [restorer (-> Source-Snapshot? boolean? any/c any/c)]
    [command-event evt?]
    [(stopped? #:mutable) boolean?]
    [(serial #:mutable) exact-nonnegative-integer?]))
@@ -194,14 +185,22 @@
 
 (define (make-place-runner #:slots [count 4]
                            #:place-start-guard [guard (lambda (thunk) (thunk))])
+  (make-place-runner/configured #:slots count #:place-start-guard guard))
+
+(define (make-place-runner/configured #:slots [count 4]
+                                      #:place-start-guard [guard (lambda (thunk) (thunk))]
+                                      #:factory [factory spawn-worker]
+                                      #:restorer [restorer restore-analysis]
+                                      #:cleanup-seconds [cleanup-seconds 1]
+                                      #:startup-seconds [startup-seconds 90]
+                                      #:cleaner [cleaner custodian-shutdown-all])
   (unless (exact-positive-integer? count)
     (raise-argument-error 'make-place-runner "exact-positive-integer?" count))
   (define runner (Place-Runner (make-async-channel) (make-semaphore 1) (make-semaphore 0) #f #f))
   (define pool
     (Pool (for/list ([_ (in-range count)]) (Slot #f #f 'empty #f #f #f #f))
-          (make-queue) (make-hasheq) (current-custodian) guard (current-place-factory)
-          (* 1000 (current-cleanup-seconds)) (* 1000 (current-startup-seconds))
-          (current-parent-cleaner)
+          (make-queue) (make-hasheq) (current-custodian) guard factory
+          (* 1000 cleanup-seconds) (* 1000 startup-seconds) cleaner restorer
           (handle-evt (Place-Runner-commands runner) Pool-Command)
           #f 0))
   (set-Place-Runner-manager!
@@ -214,7 +213,7 @@
 (define (submit-place-task! runner kind snapshot events deadline done #:work [work #f])
   (define task
     (Place-Task runner kind snapshot deadline (current-directory)
-                events done work (current-analysis-restorer) #t))
+                events done work #t))
   (call-with-semaphore
     (Place-Runner-gate runner)
     (lambda ()
@@ -471,7 +470,7 @@
         #:when (eq? (Place-Task-kind task) 'check-syntax)
         (if (Place-Task-active? task)
             (start-parent-work! pool slot task
-                                (lambda () ((Place-Task-restorer task)
+                                (lambda () ((Pool-restorer pool)
                                             (Place-Task-snapshot task) success? data))
                                 'restoring)
             (clear-slot-assignment! pool slot))]

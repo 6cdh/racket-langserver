@@ -40,6 +40,10 @@
            source-controller-ensure-analysis!
            source-controller-refresh-analysis!))
 
+(module+ test-support
+  (require (submod "source-controller/source-owner.rkt" test-support))
+  (provide make-source-controller/with-scheduler))
+
 ;; Commands on `events`, beside worker completions. Request threads never
 ;; construct these records; the functions below submit them.
 ;;

@@ -26,6 +26,9 @@
          Analysis-Completed?
          finish-analysis-task!)
 
+(module+ test-support
+  (provide make-analysis-scheduler/with-runners))
+
 ;; One source attempt until owner acceptance. Distinct from the pool task that
 ;; executes it: this registry is revoked on source changes and outlives
 ;; execution until accept returns. The pool's task table owns per-task
@@ -75,9 +78,16 @@
 (define (make-analysis-scheduler events #:analyze [analyze #f] #:resyntax resyntax
                                  #:timeout [timeout 90] #:slots [slots 4]
                                  #:place-start-guard [place-start-guard (lambda (thunk) (thunk))])
-  (Analysis-Scheduler events analyze
-                      (make-place-runner #:slots slots #:place-start-guard place-start-guard)
-                      (make-place-runner #:slots 1 #:place-start-guard place-start-guard)
+  (make-analysis-scheduler/with-runners
+    events
+    (make-place-runner #:slots slots #:place-start-guard place-start-guard)
+    (make-place-runner #:slots 1 #:place-start-guard place-start-guard)
+    #:analyze analyze #:resyntax resyntax #:timeout timeout))
+
+(define (make-analysis-scheduler/with-runners events check-runner resyntax-runner
+                                              #:analyze [analyze #f] #:resyntax resyntax
+                                              #:timeout [timeout 90])
+  (Analysis-Scheduler events analyze check-runner resyntax-runner
                       resyntax timeout (make-hash) #f))
 
 (define (attempt-key attempt)

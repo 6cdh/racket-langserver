@@ -49,6 +49,9 @@
          (struct-out Source-Failure)
          (struct-out Disk-Missing))
 
+(module+ test-support
+  (provide make-source-controller/with-scheduler))
+
 ;; Failed command or disk read. `reason` is a symbol such as `shutdown`,
 ;; `closed`, `reader-exited`, or `read-timeout`, or the value raised while
 ;; handling the command or reading the source.
@@ -99,12 +102,23 @@
                                 #:place-start-guard [place-start-guard (lambda (thunk) (thunk))]
                                 #:closed-analysis-limit [closed-analysis-limit 64]
                                 #:resyntax [resyntax (and (resyntax-available?) 'place)])
+  (make-source-controller/with-scheduler
+    (lambda (events)
+      (make-analysis-scheduler events #:analyze analyze #:resyntax resyntax
+                               #:slots slots #:timeout analysis-timeout
+                               #:place-start-guard place-start-guard))
+    #:workspace workspace #:read read #:read-timeout read-timeout
+    #:closed-analysis-limit closed-analysis-limit))
+
+(define (make-source-controller/with-scheduler make-scheduler
+                                               #:workspace [workspace current-workspace]
+                                               #:read [read read-source-text]
+                                               #:read-timeout [read-timeout 3]
+                                               #:closed-analysis-limit [closed-analysis-limit 64])
   (define events (make-async-channel))
   (Source-Controller (make-source-store) events (make-semaphore 0)
                      (make-disk-reader events #:read read #:timeout read-timeout)
-                     (make-analysis-scheduler events #:analyze analyze #:resyntax resyntax
-                                              #:slots slots #:timeout analysis-timeout
-                                              #:place-start-guard place-start-guard)
+                     (make-scheduler events)
                      (make-closed-analysis-cache closed-analysis-limit)
                      (make-analysis-publisher workspace)))
 
