@@ -44,8 +44,8 @@
         (async-channel-put entered #t)
         (sync never-evt))
       worker)
-    (define (new-runner count [restore restorer])
-      (make-place-runner/configured #:slots count #:factory factory
+    (define (new-runner count [restore restorer] [kind 'check-syntax])
+      (make-place-runner/configured kind #:slots count #:factory factory
                                     #:cleanup-seconds 0.15 #:cleaner cleaner #:restorer restore))
     (parameterize ([current-custodian custodian])
       (define runner (new-runner slots))
@@ -57,9 +57,10 @@
           (await (place-runner-shutdown-evt runner))
           (custodian-shutdown-all custodian)))))
   (define (start runner events [seconds 30] [input (snapshot)])
-    (start-place-task! runner input events seconds values))
-  (define (submit runner events kind [seconds 30])
-    (submit-place-task! runner kind (snapshot) events
+    (submit-place-task! runner input events
+                        (+ (current-deadline-milliseconds) (* 1000 seconds)) values))
+  (define (submit runner events [seconds 30])
+    (submit-place-task! runner (snapshot) events
                         (+ (current-deadline-milliseconds) (* seconds 1000)) values))
   (define (await-worker spawned)
     (match-define (cons worker control) (await spawned))
@@ -98,7 +99,7 @@
           (async-channel-put other-spawned (cons worker control))
           worker)
         (define second
-          (make-place-runner/configured #:slots 1 #:factory other-factory
+          (make-place-runner/configured 'check-syntax #:slots 1 #:factory other-factory
                                         #:restorer (lambda (_input _success data) data)))
         (dynamic-wind
           void
@@ -134,7 +135,7 @@
         (check-equal? (await events) #hasheq())
         (check-false (sync/timeout 0 control)))))
 
-  (test-case "normal cancellation waits for cleanup and reuses the same worker for both kinds"
+  (test-case "normal cancellation waits for cleanup and reuses the same worker"
     (with-runner
       (lambda (runner events spawned _new-runner)
         (define old (start runner events))
@@ -143,15 +144,14 @@
         (cancel-place-task! old)
         (check-stopped events)
         (check-equal? (await control) (Place-Cancel first-id))
-        (submit runner events 'resyntax)
+        (submit runner events)
         (check-false (sync/timeout 0 control))
         (place-channel-put control 'cancelled)
-        (match-define (struct* Place-Start ([id next-id] [kind next-kind])) (await control))
-        (check-eq? next-kind 'resyntax)
+        (match-define (struct* Place-Start ([id next-id])) (await control))
         (check-not-equal? first-id next-id)
         (cancel-place-task! old)
         (finish! control)
-        (check-equal? (await events) '())
+        (check-equal? (await events) #hasheq())
         (start runner events)
         (await control)
         (finish! control)
@@ -160,7 +160,7 @@
         (check-false (sync/timeout 0 (place-dead-evt worker)))
         (check-false (sync/timeout 0 events)))))
 
-  (for ([mode '(hang wrong-id bad-id wrong-kind die)])
+  (for ([mode '(hang die)])
     (test-case (format "~a retires only its slot before lazy replacement" mode)
       (with-runner
         (lambda (runner events spawned _new-runner)
@@ -194,7 +194,7 @@
         (await control)
         (finish! control)
         (await entered)
-        (submit runner events 'resyntax 0.05)
+        (submit runner events 0.05)
         (check-eq? (Analysis-Outcome-value (await events)) 'analysis-timeout)
         (check-false (sync/timeout 0 control))
         (cancel-place-task! task)
@@ -305,26 +305,23 @@
         (check-false (sync/timeout 0 spawned)))
       #:restorer (lambda args (apply (unbox next-restorer) args))))
 
-  (test-case "mixed kinds share the configured physical bound and FIFO"
+  (test-case "tasks share the configured physical bound and FIFO"
     (with-runner
       (lambda (runner events spawned _new-runner)
-        (submit runner events 'check-syntax)
+        (submit runner events)
         (define-values (_a ca) (await-worker spawned))
         (await ca)
-        (submit runner events 'resyntax)
+        (submit runner events)
         (define-values (_b cb) (await-worker spawned))
-        (match-define (struct* Place-Start ([kind kind-b])) (await cb))
-        (check-eq? kind-b 'resyntax)
-        (submit runner events 'resyntax)
-        (submit runner events 'check-syntax)
+        (check-pred Place-Start? (await cb))
+        (submit runner events)
+        (submit runner events)
         (finish! ca)
         (await events)
-        (match-define (struct* Place-Start ([kind next-kind-a])) (await ca))
-        (check-eq? next-kind-a 'resyntax)
+        (check-pred Place-Start? (await ca))
         (finish! ca)
         (await events)
-        (match-define (struct* Place-Start ([kind final-kind-a])) (await ca))
-        (check-eq? final-kind-a 'check-syntax)
+        (check-pred Place-Start? (await ca))
         (finish! ca)
         (await events)
         (finish! cb)
@@ -342,8 +339,7 @@
         (check-stopped events)
         (start runner events)
         (place-channel-put control 'ready)
-        (match-define (struct* Place-Start ([kind kind])) (await control))
-        (check-eq? kind 'check-syntax)
+        (check-pred Place-Start? (await control))
         (finish! control)
         (await events)
         (check-false (sync/timeout 0 spawned))
@@ -363,7 +359,7 @@
       (sync release-startup)
       worker)
     (parameterize ([current-custodian custodian])
-      (define runner (make-place-runner/configured #:startup-seconds 8 #:factory factory))
+      (define runner (make-place-runner/configured 'check-syntax #:startup-seconds 8 #:factory factory))
       (dynamic-wind
         void
         (lambda ()
@@ -449,7 +445,7 @@
           (make-source-controller/with-scheduler
             (lambda (events)
               (make-analysis-scheduler/with-runners
-                events (new-runner 2 restore-analysis) (new-runner 1 restore-analysis)
+                events (new-runner 2 restore-analysis) (new-runner 1 restore-analysis 'resyntax)
                 #:resyntax #f))))
         (dynamic-wind
           void
@@ -515,7 +511,8 @@
     (with-runner
       (lambda (_runner events spawned new-runner)
         (define scheduler
-          (make-analysis-scheduler/with-runners events (new-runner 1) (new-runner 1) #:resyntax #f))
+          (make-analysis-scheduler/with-runners
+            events (new-runner 1) (new-runner 1 restore-analysis 'resyntax) #:resyntax #f))
         (dynamic-wind
           void
           (lambda ()
@@ -535,7 +532,7 @@
             (finish! control)
             (finish-analysis-task!
               scheduler (await events 'scheduler-new)
-              (lambda (_snapshot _kind completion _parent result)
+              (lambda (_snapshot _kind completion result)
                 (check-false (sync/timeout 0 completion))
                 (check-equal? result #hasheq())
                 (Analysis-Outcome 'succeeded #f)))

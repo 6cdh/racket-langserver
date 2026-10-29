@@ -4,6 +4,7 @@
 ;; Each kind has its own lazy pool for FIFO admission and physical capacity.
 ;; This module owns same-revision sharing, supersession, and
 ;; acceptance-before-completion. `settle!` removes a source attempt.
+;; The controller stops admission before stopping the scheduler.
 ;; A pool's `settle-pool-task!` is logical task settlement and may notify
 ;; before physical cleanup. Cross-file rules are in ../analysis-lifecycle.md.
 (require racket/async-channel
@@ -22,7 +23,6 @@
          schedule-resyntax!
          cancel-source-analysis!
          stop-analysis-scheduler!
-         cancel-ineligible-analysis!
          Analysis-Completed?
          finish-analysis-task!)
 
@@ -35,14 +35,12 @@
 ;; deadlines and logical settlement; merging them would mix source lifetime
 ;; with physical capacity.
 ;;
-;; parent-completion: Installed analysis that a Resyntax attempt must still match.
 ;; completion: Waiters join this attempt's event; resolved when `settle!` runs.
 ;; deadline: Absolute milliseconds captured at enqueue, including FIFO wait.
 ;; task: Opaque pool handle for cancellation; not a worker identity.
 (struct/contract Analysis-Attempt
   ([snapshot Source-Snapshot?]
    [kind (or/c 'check-syntax 'resyntax)]
-   [parent-completion (or/c #f evt?)]
    [completion Completion-Event?]
    [deadline real?]
    [(task #:mutable) (or/c #f Place-Task?)]))
@@ -66,8 +64,7 @@
    [resyntax (or/c #f 'place (-> string? string? list?))]
    [timeout (and/c real? (>=/c 0))]
    [attempts (hash/c (cons/c Source-Id? (or/c 'check-syntax 'resyntax))
-                     Analysis-Attempt? #:immutable #f)]
-   [(stopped? #:mutable) boolean?]))
+                     Analysis-Attempt? #:immutable #f)]))
 
 ;; The event envelope carries an identity privately; replay cannot revive an
 ;; attempt removed by completion, cancellation, or a same-revision retry.
@@ -80,15 +77,15 @@
                                  #:place-start-guard [place-start-guard (lambda (thunk) (thunk))])
   (make-analysis-scheduler/with-runners
     events
-    (make-place-runner #:slots slots #:place-start-guard place-start-guard)
-    (make-place-runner #:slots 1 #:place-start-guard place-start-guard)
+    (make-place-runner 'check-syntax #:slots slots #:place-start-guard place-start-guard)
+    (make-place-runner 'resyntax #:slots 1 #:place-start-guard place-start-guard)
     #:analyze analyze #:resyntax resyntax #:timeout timeout))
 
 (define (make-analysis-scheduler/with-runners events check-runner resyntax-runner
                                               #:analyze [analyze #f] #:resyntax resyntax
                                               #:timeout [timeout 90])
   (Analysis-Scheduler events analyze check-runner resyntax-runner
-                      resyntax timeout (make-hash) #f))
+                      resyntax timeout (make-hash)))
 
 (define (attempt-key attempt)
   (cons (Source-Snapshot-id (Analysis-Attempt-snapshot attempt))
@@ -102,11 +99,11 @@
     (hash-ref (Analysis-Scheduler-attempts scheduler) (cons (source-id source) 'check-syntax) #f))
   (and attempt (Analysis-Attempt-completion attempt)))
 
-(define (enqueue! scheduler snapshot kind parent-completion)
+(define (enqueue! scheduler snapshot kind)
   (define deadline
     (+ (current-deadline-milliseconds) (* 1000 (Analysis-Scheduler-timeout scheduler))))
   (define attempt
-    (Analysis-Attempt snapshot kind parent-completion (make-completion-event) deadline #f))
+    (Analysis-Attempt snapshot kind (make-completion-event) deadline #f))
   (hash-set! (Analysis-Scheduler-attempts scheduler) (attempt-key attempt) attempt)
   (define injection
     (if (eq? kind 'check-syntax)
@@ -120,7 +117,6 @@
     (submit-place-task! (if (eq? kind 'check-syntax)
                             (Analysis-Scheduler-check-syntax-runner scheduler)
                             (Analysis-Scheduler-resyntax-runner scheduler))
-                        kind
                         snapshot (Analysis-Scheduler-events scheduler) deadline
                         (lambda (result) (Analysis-Completed attempt result)) #:work injection))
   (Analysis-Attempt-completion attempt))
@@ -132,35 +128,29 @@
   (define active
     (hash-ref (Analysis-Scheduler-attempts scheduler) (cons (source-id source) 'check-syntax) #f))
   (cond
-    [(Analysis-Scheduler-stopped? scheduler) (ready-evt (Analysis-Outcome 'stopped 'shutdown))]
     [(and active
           (eq? (Source-Snapshot-revision snapshot)
                (Source-Snapshot-revision (Analysis-Attempt-snapshot active))))
      (Analysis-Attempt-completion active)]
     [else
      (cancel-source-analysis! scheduler source)
-     (enqueue! scheduler snapshot 'check-syntax #f)]))
+     (enqueue! scheduler snapshot 'check-syntax)]))
 
-(define (schedule-resyntax! scheduler snapshot parent-completion)
-  (when (and (not (Analysis-Scheduler-stopped? scheduler))
-             (Analysis-Scheduler-resyntax scheduler))
-    (define previous
-      (hash-ref (Analysis-Scheduler-attempts scheduler)
-                (cons (Source-Snapshot-id snapshot) 'resyntax) #f))
-    (when previous (cancel-attempt! scheduler previous 'superseded))
-    (enqueue! scheduler snapshot 'resyntax parent-completion))
+;; Called once after accepting Check Syntax. Starting that attempt already
+;; cancelled any earlier Resyntax work for the source.
+(define (schedule-resyntax! scheduler snapshot)
+  (when (Analysis-Scheduler-resyntax scheduler)
+    (enqueue! scheduler snapshot 'resyntax))
   (void))
 
 (define (settle! scheduler attempt outcome)
-  (when (registered? scheduler attempt)
-    (hash-remove! (Analysis-Scheduler-attempts scheduler) (attempt-key attempt))
-    (resolve-completion! (Analysis-Attempt-completion attempt) outcome)))
+  (hash-remove! (Analysis-Scheduler-attempts scheduler) (attempt-key attempt))
+  (resolve-completion! (Analysis-Attempt-completion attempt) outcome))
 
 ;; Revoke acceptance on the owner immediately. That kind's pool handles physical cleanup.
 (define (cancel-attempt! scheduler attempt reason)
-  (when (registered? scheduler attempt)
-    (cancel-place-task! (Analysis-Attempt-task attempt))
-    (settle! scheduler attempt (Analysis-Outcome 'stopped reason))))
+  (cancel-place-task! (Analysis-Attempt-task attempt))
+  (settle! scheduler attempt (Analysis-Outcome 'stopped reason)))
 
 (define (cancel-source-analysis! scheduler source [reason 'source-changed])
   (for ([kind (in-list '(check-syntax resyntax))])
@@ -170,20 +160,13 @@
   (void))
 
 (define (stop-analysis-scheduler! scheduler)
-  (set-Analysis-Scheduler-stopped?! scheduler #t)
   (for ([attempt (in-list (hash-values (Analysis-Scheduler-attempts scheduler)))])
     (cancel-attempt! scheduler attempt 'shutdown))
   (stop-place-runner! (Analysis-Scheduler-check-syntax-runner scheduler))
   (stop-place-runner! (Analysis-Scheduler-resyntax-runner scheduler)))
 
-;; Source eligibility remains an owner decision; this does no admission work.
-(define (cancel-ineligible-analysis! scheduler current?)
-  (for ([attempt (in-list (hash-values (Analysis-Scheduler-attempts scheduler)))]
-        #:unless (current? (Analysis-Attempt-snapshot attempt)))
-    (cancel-attempt! scheduler attempt 'source-changed)))
-
 ;; `accept` runs inline for the current registered attempt only. It receives
-;; snapshot, kind, completion, parent-completion, and worker result, and returns
+;; snapshot, kind, completion, and worker result, and returns
 ;; an `Analysis-Outcome` after installing or discarding the result and
 ;; translating domain failures. Only then may this attempt's completion become ready.
 (define (finish-analysis-task! scheduler message accept)
@@ -193,7 +176,7 @@
     ;; Acceptance may change source state; it does not wait for the worker.
     (define outcome
       (accept (Analysis-Attempt-snapshot attempt) (Analysis-Attempt-kind attempt)
-              (Analysis-Attempt-completion attempt) (Analysis-Attempt-parent-completion attempt)
+              (Analysis-Attempt-completion attempt)
               (if (>= (current-deadline-milliseconds) (Analysis-Attempt-deadline attempt))
                   (Analysis-Outcome 'failed 'analysis-timeout)
                   (Analysis-Completed-result message))))

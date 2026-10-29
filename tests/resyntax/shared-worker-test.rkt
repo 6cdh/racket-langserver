@@ -1,8 +1,7 @@
 #lang racket/base
 
 ;; Interrupted real Check Syntax and installed Resyntax must clean job
-;; resources and reuse the same place. This drives one worker directly;
-;; production uses a separate pool per kind. An availability skip does not
+;; resources and reuse their own places. An availability skip does not
 ;; establish Resyntax integration.
 
 (require "../../lsp/analysis-place-protocol.rkt"
@@ -35,18 +34,19 @@
       "  (sync never-evt)"))
 
 (module+ test
-  (test-case "real worker cleans cancelled readers and reuses both analysis stacks"
+  (test-case "real workers clean cancelled jobs and reuse each analysis stack"
     (define root (make-temporary-file "shared-worker~a" 'directory))
     (define listener (tcp-listen 0 4 #t "127.0.0.1"))
     (define-values (_host port _remote _remote-port) (tcp-addresses listener #t))
     (define worker (dynamic-place worker-path 'run))
+    (define resyntax-worker (dynamic-place worker-path 'run))
     (dynamic-wind
       void
       (lambda ()
         (place-channel-put worker (Place-Prepare 'check-syntax))
         ;; A stale cancel during first initialization must not own its lifetime.
         (place-channel-put worker (Place-Cancel 'obsolete))
-        (check-equal? (receive worker) (Place-Ready 'check-syntax))
+        (check-equal? (receive worker) (Place-Ready))
         (define reader (build-path root "reader.rkt"))
         (call-with-output-file reader
           (lambda (out)
@@ -60,7 +60,7 @@
               out)))
         (define uri (~a "file://" (build-path root "source.rkt")))
         (place-channel-put worker
-                           (Place-Start 1 'check-syntax uri
+                           (Place-Start 1 uri
                                         (~a "#reader (file " (~s (path->string reader)) ")\n")
                                         root))
         ;; This message is emitted inside read-syntax after child resources exist.
@@ -68,7 +68,7 @@
         (define-values (reader-in reader-out) (tcp-accept listener))
         (match-define (Resources-Started 'reader-start owned-port) (read reader-in))
         (place-channel-put worker (Place-Cancel 1))
-        (check-equal? (receive worker) (Place-Terminal 1 (Place-Cancelled)))
+        (check-equal? (receive worker) (Place-Terminal (Place-Cancelled)))
         (check-not-false (sync/timeout 5 reader-in))
         (check-true (eof-object? (read reader-in)))
         (check-exn exn:fail:network?
@@ -77,18 +77,18 @@
         (close-output-port reader-out)
         ;; A boundary exception must clean the job and preserve this exact place.
         (place-channel-put worker
-                           (Place-Start 2 'check-syntax uri #f root))
-        (check-match (receive worker) (Place-Terminal 2 (Place-Failure (? string?))))
+                           (Place-Start 2 uri #f root))
+        (check-match (receive worker) (Place-Terminal (Place-Failure (? string?))))
         (place-channel-put worker (Place-Cancel 1))
         (place-channel-put worker
-                           (Place-Start 3 'check-syntax uri
+                           (Place-Start 3 uri
                                         "#lang racket/base\n(define value 42)\n" root))
-        (check-match (receive worker) (Place-Terminal 3 (Place-Check-Syntax-Result #t _)))
-        (place-channel-put worker (Place-Prepare 'resyntax))
-        (check-equal? (receive worker) (Place-Ready 'resyntax))
-        (place-channel-put worker
-                           (Place-Start 4 'resyntax uri "#lang racket/base\n" root))
-        (check-match (receive worker) (Place-Terminal 4 (Place-Resyntax-Result (? list?))))
+        (check-match (receive worker) (Place-Terminal (Place-Check-Syntax-Result #t _)))
+        (place-channel-put resyntax-worker (Place-Prepare 'resyntax))
+        (check-equal? (receive resyntax-worker) (Place-Ready))
+        (place-channel-put resyntax-worker
+                           (Place-Start 4 uri "#lang racket/base\n" root))
+        (check-match (receive resyntax-worker) (Place-Terminal (Place-Resyntax-Result (? list?))))
         (when (resyntax-available?)
           ;; The message comes from real Resyntax expansion, after its child
           ;; resources exist. Cancellation must preserve the initialized stack.
@@ -98,42 +98,41 @@
                 "(begin-for-syntax\n"
                 (blocking-handshake-source port 'resyntax-start)
                 ")\n"))
-          (place-channel-put worker (Place-Start 20 'resyntax uri blocking-source root))
+          (place-channel-put resyntax-worker (Place-Start 20 uri blocking-source root))
           (check-not-false (sync/timeout 60 listener))
           (define-values (in out) (tcp-accept listener))
           (match-define (Resources-Started 'resyntax-start child-port) (read in))
-          (place-channel-put worker (Place-Cancel 20))
-          (check-equal? (receive worker) (Place-Terminal 20 (Place-Cancelled)))
+          (place-channel-put resyntax-worker (Place-Cancel 20))
+          (check-equal? (receive resyntax-worker) (Place-Terminal (Place-Cancelled)))
           (check-not-false (sync/timeout 5 in))
           (check-true (eof-object? (read in)))
           (check-exn exn:fail:network? (lambda () (tcp-connect "127.0.0.1" child-port)))
           (close-input-port in)
           (close-output-port out)
-          (place-channel-put worker
-                             (Place-Start 21 'resyntax uri
+          (place-channel-put resyntax-worker
+                             (Place-Start 21 uri
                                           "#lang racket\n(or 1 (or 2 3))" root))
-          (define result (receive worker))
-          (check-match result (Place-Terminal 21 (Place-Resyntax-Result (list _))))
-          (match-define (Place-Terminal 21 (Place-Resyntax-Result (list finding))) result)
+          (define result (receive resyntax-worker))
+          (check-match result (Place-Terminal (Place-Resyntax-Result (list _))))
+          (match-define (Place-Terminal (Place-Resyntax-Result (list finding))) result)
           (check-equal? (hash-ref finding 'new-text) "(or 1 2 3)"))
-        ;; Either completion or cancellation may win; each ID has one terminal.
-        ;; The subsequent ready response also detects a duplicate terminal.
+        ;; Either completion or cancellation may win; each job has one terminal.
+        ;; A subsequent job response also detects a duplicate terminal.
         (for ([id (in-range 5 9)])
           (place-channel-put worker
-                             (Place-Start id 'check-syntax uri
+                             (Place-Start id uri
                                           "#lang racket/base\n" root))
           (place-channel-put worker (Place-Cancel id))
           (define terminal (receive worker))
           (check-true
             (match terminal
-              [(Place-Terminal received-id (or (Place-Check-Syntax-Result #t _) (Place-Cancelled)))
-               (equal? received-id id)]
-              [_ #f]))
-          (place-channel-put worker (Place-Prepare 'check-syntax))
-          (check-equal? (receive worker) (Place-Ready 'check-syntax)))
+              [(Place-Terminal (or (Place-Check-Syntax-Result #t _) (Place-Cancelled))) #t]
+              [_ #f])))
         (check-false (sync/timeout 0 (place-dead-evt worker))))
       (lambda ()
         (place-kill worker)
         (place-wait worker)
+        (place-kill resyntax-worker)
+        (place-wait resyntax-worker)
         (tcp-close listener)
         (delete-directory/files root)))))

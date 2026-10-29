@@ -14,6 +14,7 @@
 
 (provide await observation acquire view refresh notify open! close! change! request!
          check-error barrier controller-barrier shutdown! response with-session drive-controller
+         acquire-snapshot
          scratch (struct-out Session) (struct-out Gate) wait-at-gate release-gate!)
 
 (define-runtime-path scratch-path "../../.agent-scratch")
@@ -78,6 +79,11 @@
     (if (eq? (car next) 'result)
         (cdr next)
         (begin (source-controller-handle! controller (cdr next)) (loop)))))
+
+;; Acquire on a test-owned controller, driving its command queue.
+(define (acquire-snapshot controller snapshot [timeout 5])
+  (Analysis-Handle-completion-evt
+    (drive-controller controller (source-controller-analysis-evt controller snapshot) timeout)))
 
 ;; Receiving a Gate establishes that this invocation reached the held work.
 ;; Each analyzer or reader interprets the released command in its own way.

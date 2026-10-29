@@ -3,6 +3,7 @@
 ;; Ordered disk observations, owned by one consumer. Commands accepted during
 ;; an active read share its successor; only the consumer decides what an
 ;; observation means for source authority and the response to its waiters.
+;; The controller stops admission before stopping the reader.
 (require racket/async-channel
          racket/contract
          racket/file
@@ -18,7 +19,8 @@
          (contract-out
            [make-disk-reader
             (->* (async-channel?)
-                 (#:read (-> path? any/c) #:timeout (and/c real? (>=/c 0)))
+                 (#:read (-> path? (or/c string? Disk-Missing?))
+                  #:timeout (and/c real? (>=/c 0)))
                  Disk-Reader?)]
            [read-source-text (-> path? (or/c string? Disk-Missing?))]
            [request-disk-read! (-> Disk-Reader? Source-View? Completion-Event?)]
@@ -47,20 +49,17 @@
 
 (struct/contract Disk-Reader
   ([events async-channel?]
-   [read (-> path? any/c)]
+   [read (-> path? (or/c string? Disk-Missing?))]
    [timeout (and/c real? (>=/c 0))]
-   [lanes (hash/c Source-Id? Read-Lane? #:immutable #f)]
-   [stopped? boolean?]
-   [stop-response any/c])
+   [lanes (hash/c Source-Id? Read-Lane? #:immutable #f)])
   #:mutable)
 
 (struct/contract Disk-Read-Completed
-  ([source Source?]
-   [attempt Read-Attempt?]
+  ([attempt Read-Attempt?]
    [result (or/c string? Disk-Missing? Disk-Read-Failure?)]))
 
 (define (make-disk-reader events #:read [read read-source-text] #:timeout [timeout 3])
-  (Disk-Reader events read timeout (make-hash) #f #f))
+  (Disk-Reader events read timeout (make-hash)))
 
 ;; POSIX ENOENT/ENOTDIR; Windows FILE_NOT_FOUND/PATH_NOT_FOUND.
 (define (missing-file-errno? errno)
@@ -82,42 +81,33 @@
       (Disk-Reader-events reader) (Disk-Reader-timeout reader)
       (lambda ()
         (define result ((Disk-Reader-read reader) (source-file-path source)))
-        (cond
-          [(string? result) (string->immutable-string result)]
-          [(or (Disk-Missing? result) (Disk-Read-Failure? result)) result]
-          [else (Disk-Read-Failure result)]))
+        (if (string? result) (string->immutable-string result) result))
       #:fail Disk-Read-Failure
       #:exited 'reader-exited
       #:timed-out 'read-timeout
-      #:done (lambda (result) (Disk-Read-Completed source attempt result))))
+      #:done (lambda (result) (Disk-Read-Completed attempt result))))
   (set-Read-Attempt-worker! attempt worker)
   attempt)
 
 (define (request-disk-read! reader started-view)
+  (define lanes (Disk-Reader-lanes reader))
+  (define key (source-id (Source-View-source started-view)))
+  (define lane (hash-ref lanes key #f))
   (cond
-    [(Disk-Reader-stopped? reader)
-     (define completion (make-completion-event))
-     (resolve-completion! completion (Disk-Reader-stop-response reader))
-     completion]
+    [lane
+     (unless (Read-Lane-pending lane)
+       (set-Read-Lane-pending! lane (make-completion-event)))
+     (Read-Lane-pending lane)]
     [else
-     (define lanes (Disk-Reader-lanes reader))
-     (define key (source-id (Source-View-source started-view)))
-     (define lane (hash-ref lanes key #f))
-     (cond
-       [lane
-        (unless (Read-Lane-pending lane)
-          (set-Read-Lane-pending! lane (make-completion-event)))
-        (Read-Lane-pending lane)]
-       [else
-        (define completion (make-completion-event))
-        (hash-set! lanes key (Read-Lane (start-read! reader started-view completion) #f))
-        completion])]))
+     (define completion (make-completion-event))
+     (hash-set! lanes key (Read-Lane (start-read! reader started-view completion) #f))
+     completion]))
 
 (define (finish-disk-read! reader message accept)
-  (define key (source-id (Disk-Read-Completed-source message)))
+  (define attempt (Disk-Read-Completed-attempt message))
+  (define key (source-id (Source-View-source (Read-Attempt-started-view attempt))))
   (define lanes (Disk-Reader-lanes reader))
   (define lane (hash-ref lanes key #f))
-  (define attempt (Disk-Read-Completed-attempt message))
   (when (and lane (eq? attempt (Read-Lane-active lane)))
     ;; Acceptance must finish before any response is visible. The successor
     ;; captures the accepted view, never the view of a command queued earlier.
@@ -149,12 +139,9 @@
   (void))
 
 (define (stop-disk-reader! reader response)
-  (unless (Disk-Reader-stopped? reader)
-    (set-Disk-Reader-stopped?! reader #t)
-    (set-Disk-Reader-stop-response! reader response)
-    (define lanes (Disk-Reader-lanes reader))
-    (define abandoned (hash-values lanes))
-    (hash-clear! lanes)
-    (for ([lane (in-list abandoned)])
-      (cancel-lane! lane response)))
+  (define lanes (Disk-Reader-lanes reader))
+  (define abandoned (hash-values lanes))
+  (hash-clear! lanes)
+  (for ([lane (in-list abandoned)])
+    (cancel-lane! lane response))
   (void))

@@ -37,7 +37,6 @@
            source-controller-shutdown!
            source-controller-view
            source-controller-snapshot
-           source-controller-ensure-analysis!
            source-controller-refresh-analysis!))
 
 (module+ test-support
@@ -120,5 +119,4 @@
      (answer! controller reply (lambda () (source-controller-acquire-analysis! controller snapshot)))]
     [(Validate-View view reply)
      (answer! controller reply (lambda () (source-controller-current-view? controller view)))]
-    [_ (source-controller-handle-completion! controller event)])
-  (source-controller-cancel-ineligible-analysis! controller))
+    [_ (source-controller-handle-completion! controller event)]))

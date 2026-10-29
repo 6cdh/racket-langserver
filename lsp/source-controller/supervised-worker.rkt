@@ -14,6 +14,7 @@
 
 ;; launch runs inside the resource boundary, including any parallel-thread pool it creates.
 ;; The supervisor stays outside: work may shut down its own custodian before reporting.
+;; Both work and fail must return non-#f values so a queued result can be polled on death.
 (define (start-supervised-worker! events seconds work
                                   #:launch [launch thread]
                                   #:fail fail
@@ -36,10 +37,8 @@
         (sync result-ch
               (wrap-evt (thread-dead-evt worker)
                         (lambda (_)
-                          ;; Death and a queued result can both be ready. Boxing the poll
-                          ;; distinguishes a returned #f from an absent result.
-                          (define result (sync/timeout 0 (wrap-evt result-ch box)))
-                          (if result (unbox result) (fail exited))))
+                          ;; Death and a queued result can both be ready.
+                          (or (async-channel-try-get result-ch) (fail exited))))
               (wrap-evt (deadline-evt deadline) (lambda (_) (fail timed-out)))))
       ;; Release resources before notifying the owner, even if done itself raises.
       (stop-supervised-worker! handle)

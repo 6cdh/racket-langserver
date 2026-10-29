@@ -28,7 +28,7 @@
          "../../lsp/source-controller.rkt"
          (only-in (submod "../../lsp/source-controller.rkt" owner)
                   source-controller-handle! source-controller-shutdown!
-                  source-controller-snapshot source-controller-ensure-analysis!)
+                  source-controller-snapshot)
          "../../workspace/api.rkt"
          "../../workspace/current.rkt"
          "../../workspace/source-store.rkt"
@@ -141,8 +141,8 @@
                        (string-replace a-text "\"b.rkt\"" (format "(file ~s)" (path->string b)))
                        0)
         (check-eq? (Analysis-Outcome-state
-                     (drive (source-controller-ensure-analysis!
-                              controller (source-controller-snapshot controller (path->source a)))))
+                     (drive (acquire-snapshot
+                              controller (source-controller-snapshot controller (path->source a)) 90)))
                    'succeeded)
         (proc a b reads capture run drive accept-command!)))
     (lambda ()

@@ -93,7 +93,6 @@ command.
 - Close handles retention, cancellation, and removal of publications.
 - `source-controller-refresh-analysis!` joins active work or starts another
   attempt after completion.
-- `source-controller-ensure-analysis!` also reuses a current completed success.
 
 ## Ownership
 
@@ -124,8 +123,7 @@ session; the request layer must use that same workspace.
   completion, and routing to a pool per kind
 - `source-controller/place-runner.rkt`: one pool's FIFO, deadlines, slots,
   restoration, and recovery
-- `analysis-place.rkt`: persistent control loop and per-job threads; one place
-  can load both task kinds
+- `analysis-place.rkt`: persistent control loop and per-job threads for one kind
 - `source-controller/supervised-worker.rkt`: independent disk-read supervision
 - `source-controller/analysis-publisher.rkt`: installation, diagnostics, and
   Resyntax publication; buffer operations require the controller-held SafeDoc
@@ -147,9 +145,9 @@ request commands and not a callback registry.
   knowledge, cancels analysis when that view changes, and returns the observer
   response plus the successor disk view. The reader then answers current
   waiters and starts any queued read using that successor view.
-- Analysis acceptance receives the snapshot, kind, completion, parent
-  completion (for Resyntax), and result. The controller validates revision and
-  executor products, installs or discards analysis, and translates acceptance
+- Analysis acceptance receives the snapshot, kind, completion, and result.
+  The controller checks the revision,
+  installs or discards analysis, and translates acceptance
   failures to terminal outcomes. The scheduler removes the attempt and
   resolves its event only after acceptance returns. Successful open-buffer
   analysis may submit Resyntax during acceptance. Its worker may start before
@@ -265,14 +263,16 @@ still follow the ordinary job-failure path.
 
 Cancellation acknowledgment waits one second. Native startup and the first
 library initialization share one 90-second watchdog, armed at dispatch and not
-renewed when the place is created. A second kind on an existing worker, which
-production pools do not send, gets a new 90-second watchdog. These are
+renewed when the place is created. These are
 operational defaults, not measured bounds. Repeated cancellation does not
 restart the startup watchdog or the cleanup-acknowledgment timer.
 A stalled worker is killed and observed terminated before its slot becomes
 free. Replacement is lazy. Jobs are never retried automatically.
 
 ### Shutdown
+
+The controller rejects new disk and analysis commands before stopping its
+reader and scheduler. Their operations are serialized on the consumer.
 
 Shutdown stops admission and dispatch, settles outstanding tasks, stops parent
 work, and retires starting, active, and idle workers. The pool's internal
@@ -288,16 +288,17 @@ under the pool's owning session lifetime.
 The wire uses the prefab structs in `analysis-place-protocol.rkt` for preparation
 and readiness, start, cancellation, and terminal messages. Check Syntax and Resyntax
 have separate result structs. Pool and worker event structs stay local to their
-threads. Every job command and terminal reply carries a unique assignment ID.
-The manager reads messages from the assigned physical worker and validates that
-ID, so an obsolete result or cancel cannot affect a later task.
+threads. Each start and cancel command carries a unique assignment ID.
+The worker ignores a cancel for another assignment. The manager keeps the slot
+reserved until the terminal reply or retirement, so it relies on the worker to
+send at most one terminal per assignment before reusing the slot.
 
 - Reader and expansion errors remain completed Check Syntax products with
   diagnostics.
 - A caught job exception with completed cleanup fails its task and keeps the
   worker.
 - Parent restoration errors fail their task and keep the cleaned worker.
-- Worker death, initialization failure, malformed protocol, or unacknowledged
+- Worker death, initialization failure, or unacknowledged
   cancellation retires the worker. A queued terminal reply is inspected before
   reporting premature death. After valid transfer, parent restoration and
   cleanup may finish independently before retirement; a dead worker is never
@@ -325,9 +326,9 @@ product never completes that event or starts Resyntax.
 Only active attempts occupy the analysis scheduler's private attempt table.
 Every terminal attempt is removed. An accepted available result retains its
 completion event, so repeated acquisitions can reuse success without retaining
-the job. Resyntax acceptance compares its parent completion with the installed
-result's completion; same-revision retries cannot accept an old attempt's
-findings.
+the job. Starting a new Check Syntax attempt cancels the source's Resyntax
+attempt, and attempt identity rejects its delayed result even for a
+same-revision retry.
 
 Exact editor queries require available analysis under the current source
 revision; otherwise they wait for fresh completion. Fast local queries keep

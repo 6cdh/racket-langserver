@@ -49,8 +49,8 @@
       (define scheduler
         (make-analysis-scheduler/with-runners
           (make-async-channel)
-          (make-place-runner/configured #:slots 2 #:factory factory)
-          (make-place-runner/configured #:slots 1 #:factory factory)
+          (make-place-runner/configured 'check-syntax #:slots 2 #:factory factory)
+          (make-place-runner/configured 'resyntax #:slots 1 #:factory factory)
           #:resyntax 'place))
       (dynamic-wind
         void
@@ -65,7 +65,7 @@
           (check-equal? (await control-b) (Peer-Preparing 'check-syntax))
           ;; Both Check Syntax slots are occupied. Resyntax still starts its own place.
           (define input (snapshot "resyntax.rkt"))
-          (schedule-resyntax! scheduler input always-evt)
+          (schedule-resyntax! scheduler input)
           (match-define (cons resyntax control-r) (await created))
           (check-equal? (await control-r) (Peer-Preparing 'resyntax))
           (check-false (sync/timeout 0 created))
@@ -108,7 +108,7 @@
           (check-eq? (await checks) a)
           (define second (request-analysis! scheduler b))
           (check-eq? (await checks) b)
-          (schedule-resyntax! scheduler r1 always-evt)
+          (schedule-resyntax! scheduler r1)
           (check-equal? (await rewrites) (Source-Snapshot-uri r1))
           (define third (request-analysis! scheduler c))
           (check-false (sync/timeout 0 checks))
@@ -119,13 +119,11 @@
           (for ([_ (in-range 4)])
             (finish-analysis-task!
               scheduler (await events)
-              (lambda (_snapshot kind _completion parent result)
+              (lambda (_snapshot kind _completion result)
                 (case kind
                   [(check-syntax)
-                   (check-false parent)
                    (check-true (Analysis-Product-succeeded? result))]
                   [(resyntax)
-                   (check-eq? parent always-evt)
                    (check-equal? result '())])
                 (Analysis-Outcome 'succeeded #f))))
           (for ([done (in-list (list first second third))])

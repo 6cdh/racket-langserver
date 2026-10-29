@@ -88,11 +88,9 @@
         (check-false (evt-ready? fresh))
         (finish-disk-read! reader (next-message events)
                            (lambda (_started _result) (values 'fresh initial)))
-        (check-eq? (await fresh) 'fresh)
-        (stop-disk-reader! reader 'shutdown)
-        (check-eq? (await (request-disk-read! reader initial)) 'shutdown))))
+        (check-eq? (await fresh) 'fresh))))
 
-  (test-case "malformed injected results become disk failures"
+  (test-case "invalid reader results fail inside the supervised worker"
     (define events (make-async-channel))
     (with-reader
       events (lambda (_) '(bad result))
@@ -101,6 +99,7 @@
         (define completion (request-disk-read! reader initial))
         (finish-disk-read! reader (next-message events)
                            (lambda (_started result)
-                             (check-equal? result (Disk-Read-Failure '(bad result)))
+                             (check-pred Disk-Read-Failure? result)
+                             (check-pred exn:fail:contract? (Disk-Read-Failure-reason result))
                              (values 'failed initial)))
         (check-eq? (await completion) 'failed)))))

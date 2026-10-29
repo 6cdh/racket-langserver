@@ -29,12 +29,14 @@
   ;; when a test asks to run a job; shared-worker-test.rkt covers real readiness.
   (define worker #f)
   (define pending #f)
+  (define kind #f)
   (define manual-prepare? #f)
   (let loop ()
     (match (sync (handle-evt channel Peer-Wire)
                  (handle-evt control Peer-Command))
-      [(Peer-Wire (Place-Prepare kind))
-       (define ready (Place-Ready kind))
+      [(Peer-Wire (Place-Prepare requested-kind))
+       (set! kind requested-kind)
+       (define ready (Place-Ready))
        (if manual-prepare?
            (begin (set! pending ready) (place-channel-put control (Peer-Preparing kind)))
            (place-channel-put channel ready))]
@@ -47,34 +49,21 @@
        (place-channel-put control 'configured)]
       [(Peer-Command 'ready) (place-channel-put channel pending)]
       [(Peer-Command 'cancelled)
-       (match-define (struct* Place-Start ([id id])) pending)
-       (place-channel-put channel (Place-Terminal id (Place-Cancelled)))]
+       (place-channel-put channel (Place-Terminal (Place-Cancelled)))]
       [(Peer-Command 'finish)
-       (match-define (struct* Place-Start ([id id] [kind kind])) pending)
        (place-channel-put channel
-                          (Place-Terminal id
-                                          (if (eq? kind 'resyntax)
+                          (Place-Terminal (if (eq? kind 'resyntax)
                                               (Place-Resyntax-Result '())
                                               (Place-Check-Syntax-Result #t #hasheq()))))]
       [(Peer-Command (Peer-Reply payload))
-       (match-define (struct* Place-Start ([id id])) pending)
-       (place-channel-put channel (Place-Terminal id payload))]
-      [(Peer-Command 'wrong-id)
-       (match-define (struct* Place-Start ([id id])) pending)
-       (place-channel-put channel (Place-Terminal (add1 id) (Place-Cancelled)))]
-      [(Peer-Command 'bad-id)
-       (place-channel-put channel (Place-Terminal 'invalid-id (Place-Cancelled)))]
-      [(Peer-Command 'wrong-kind)
-       (match-define (struct* Place-Start ([id id])) pending)
-       (place-channel-put channel (Place-Terminal id (Place-Resyntax-Result '())))]
+       (place-channel-put channel (Place-Terminal payload))]
       [(Peer-Command 'failure)
-       (match-define (struct* Place-Start ([id id])) pending)
-       (place-channel-put channel (Place-Terminal id (Place-Failure "job failure")))]
+       (place-channel-put channel (Place-Terminal (Place-Failure "job failure")))]
       [(Peer-Command 'run)
        (unless worker
-         (set! worker (thread (lambda () ((dynamic-require worker-path 'run) remote)))))
-       (place-channel-put local (Place-Prepare (Place-Start-kind pending)))
-       (place-channel-get local)
+         (set! worker (thread (lambda () ((dynamic-require worker-path 'run) remote))))
+         (place-channel-put local (Place-Prepare kind))
+         (place-channel-get local))
        (place-channel-put local pending)
        (place-channel-put channel (place-channel-get local))
        (place-channel-put control 'cleaned)]

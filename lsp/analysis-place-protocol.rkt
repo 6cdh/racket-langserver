@@ -1,15 +1,14 @@
 #lang racket/base
 
 ;; Parent/worker wire for analysis places. Prefab structs keep their types
-;; across place channels. struct/contract does not support #:prefab; receivers
-;; validate fields and assignment identity at the boundary. Contracted prefab
-;; accessors would reject malformed fields before parent recovery, so exports
-;; stay uncontracted.
+;; across place channels. struct/contract does not support #:prefab.
 ;;
 ;; kind: `'check-syntax` or `'resyntax`.
 ;; id: Unique assignment identity, not a slot index. The worker ignores a
-;;   Place-Cancel for another job; the pool treats a mismatched Place-Terminal
-;;   as a protocol failure and retires the worker.
+;;   Place-Cancel for another job.
+;;   A worker sends at most one terminal per job, after cleanup; the pool keeps its
+;;   slot reserved until that terminal or worker retirement. A late cancel
+;;   after a terminal therefore cannot produce another reply for that job.
 ;;   Initialization has no job id, so a cancel cannot abort it.
 ;; Place-Prepare / Place-Ready: load `kind` under a persistent worker lifetime.
 ;; Place-Start / Place-Terminal: one job. The terminal is sent only after job
@@ -31,13 +30,13 @@
 (struct Place-Prepare (kind) #:prefab)
 
 ;; `directory` is the job working directory.
-(struct Place-Start (id kind uri text directory) #:prefab)
+(struct Place-Start (id uri text directory) #:prefab)
 
 (struct Place-Cancel (id) #:prefab)
 
-(struct Place-Ready (kind) #:prefab)
+(struct Place-Ready () #:prefab)
 
-(struct Place-Terminal (id outcome) #:prefab)
+(struct Place-Terminal (outcome) #:prefab)
 
 (struct Place-Init-Failure (detail) #:prefab)
 

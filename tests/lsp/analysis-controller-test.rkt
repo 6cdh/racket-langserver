@@ -527,20 +527,19 @@
           [else (set! published (cons params published))])))
     (source-controller-open! controller (path->source path) sd)
     (define snapshot (source-controller-snapshot controller (path->source path)))
-    (define first (source-controller-ensure-analysis! controller snapshot))
+    (define first (with-read-safedoc sd SafeDoc-analysis-completion))
     (define old-message (await (source-controller-events controller)))
     ;; A real installation failure settles the attempt without rewriting its
     ;; message or accessing the scheduler's private attempt record.
     (source-controller-handle! controller old-message)
     (check-equal? (await first) (Analysis-Outcome 'failed 'publication-failed))
-    (define retry (source-controller-ensure-analysis! controller snapshot))
-    (source-controller-handle! controller (await (source-controller-events controller)))
-    (define accepted (await retry))
+    (define retry (acquire-snapshot controller snapshot))
+    (define accepted (drive-controller controller retry))
     (check-eq? 'succeeded (Analysis-Outcome-state accepted))
     (check-equal? (length published) 1)
     (source-controller-handle! controller old-message)
     (check-equal? (length published) 1)
-    (check-eq? accepted (await (source-controller-ensure-analysis! controller snapshot)))
+    (check-eq? accepted (await (acquire-snapshot controller snapshot)))
     (source-controller-close! controller (path->source path) sd)
     (source-controller-shutdown! controller))
 
@@ -585,8 +584,7 @@
                                      (lambda (_method params) (set! published (cons params published))))
     (define sd (new-safedoc (path->uri path) text 7))
     (source-controller-open! controller (path->source path) sd)
-    (define first (source-controller-ensure-analysis!
-                    controller (source-controller-snapshot controller (path->source path))))
+    (define first (with-read-safedoc sd SafeDoc-analysis-completion))
     (define old-message (await (source-controller-events controller)))
     (source-controller-edit! controller sd
                              (lambda (doc) (doc-update-version! doc 8)))
@@ -596,8 +594,7 @@
     (source-controller-close! controller (path->source path) sd)
     (define reopened (new-safedoc (path->uri path) text 7))
     (source-controller-open! controller (path->source path) reopened)
-    (define next (source-controller-ensure-analysis!
-                   controller (source-controller-snapshot controller (path->source path))))
+    (define next (with-read-safedoc reopened SafeDoc-analysis-completion))
     ;; Cancelled attempts may still post worker-exit messages. Pump those too
     ;; until the reopened source's current attempt is settled.
     (let loop ()
@@ -662,37 +659,7 @@
                     (release-gate! (await probes))
                     (check-eq? 'succeeded (Analysis-Outcome-state (await queued)))
                     (close! session b)
-                    (barrier session))))
-
-  (test-case "malformed acceptance is terminal and releases a slot for queued work"
-    (define probes (make-async-channel))
-    (with-session
-      (make-source-controller
-        #:analysis-slots 1
-        #:analyze (lambda (snapshot)
-                    (define product ((controlled-analyzer probes) snapshot))
-                    (define path (source-file-path (Source-Snapshot-source snapshot)))
-                    (if (regexp-match? #rx"bad-product" (path->string path))
-                        (Analysis-Product #t (Analysis-Product-summary product) '()
-                                          (Analysis-Product-trace product) #f)
-                        product)))
-      (lambda (session)
-        (define a (build-path scratch "bad-product.rkt"))
-        (define b (build-path scratch "good-product.rkt"))
-        (open! session a text)
-        (define first-probe (await probes))
-        (open! session b text)
-        (barrier session)
-        (define first (acquire session a))
-        (define queued (acquire session b))
-        (release-gate! first-probe)
-        (check-eq? 'failed (Analysis-Outcome-state (await first)))
-        (check-equal? (notifications session) '())
-        (release-gate! (await probes))
-        (check-eq? 'succeeded (Analysis-Outcome-state (await queued)))
-        (close! session a)
-        (close! session b)
-        (barrier session)))))
+                    (barrier session)))))
 
 (module+ test
   (test-case "shared Resyntax worker death discards findings and the next revision recovers"
@@ -714,8 +681,8 @@
             (make-source-controller/with-scheduler
               (lambda (events)
                 (make-analysis-scheduler/with-runners
-                  events (make-place-runner/configured #:slots 1 #:factory factory)
-                  (make-place-runner/configured #:slots 1 #:factory factory)
+                  events (make-place-runner/configured 'check-syntax #:slots 1 #:factory factory)
+                  (make-place-runner/configured 'resyntax #:slots 1 #:factory factory)
                   #:analyze (controlled-analyzer probes) #:resyntax 'place)))
             (lambda (session)
               (define path (build-path scratch "actual-resyntax-death.rkt"))
@@ -724,7 +691,7 @@
               (barrier session)
               (define accepted (await (acquire session path)))
               (match-define (cons old control) (await created))
-              (check-match (await control) (struct* Place-Start ([kind 'resyntax])))
+              (check-pred Place-Start? (await control))
               (place-channel-put control 'die)
               (let loop ()
                 (define log (await logs))
@@ -738,7 +705,7 @@
               (await (acquire session path))
               (match-define (cons fresh fresh-control) (await created))
               (check-not-eq? fresh old)
-              (check-match (await fresh-control) (struct* Place-Start ([kind 'resyntax])))
+              (check-pred Place-Start? (await fresh-control))
               (define finding (Resyntax-Result 0 5 "accepted" 'test "new"))
               (place-channel-put fresh-control
                                  (Peer-Reply (Place-Resyntax-Result (list (->jsexpr finding)))))
@@ -920,6 +887,47 @@
                    (check-equal? (with-read-doc reopened doc-get-text) text)))))
 
 (module+ test
+  (test-case "same-revision refresh rejects a delayed Resyntax result"
+    (define probes (make-async-channel))
+    (define started (make-async-channel))
+    (define release (make-async-channel))
+    (define controller
+      (make-source-controller
+        #:analyze (controlled-analyzer probes)
+        #:resyntax (lambda (_text _uri)
+                     (async-channel-put started #t)
+                     (async-channel-get release))))
+    (define publications '())
+    (source-controller-set-notifier!
+      controller (lambda (_ params) (set! publications (cons params publications))))
+    (define enabled? (get-resyntax-enabled))
+    (dynamic-wind
+      (lambda () (set-resyntax-enabled! #t))
+      (lambda ()
+        (with-buffer controller (build-path scratch "same-revision-resyntax.rkt")
+                     (lambda (sd source)
+                       (define first (with-read-safedoc sd SafeDoc-analysis-completion))
+                       (release-gate! (await probes))
+                       (drive-controller controller first)
+                       (await started)
+                       (async-channel-put release (list (Resyntax-Result 0 5 "old" 'test "old")))
+                       (define stale (await (source-controller-events controller)))
+                       (check-pred Analysis-Completed? stale)
+                       (source-controller-refresh-analysis! controller source)
+                       (define fresh (with-read-safedoc sd SafeDoc-analysis-completion))
+                       (release-gate! (await probes))
+                       (drive-controller controller fresh)
+                       (await started)
+                       (define before publications)
+                       (source-controller-handle! controller stale)
+                       (check-equal? publications before)
+                       (check-equal? (with-read-doc sd doc-get-resyntax-results) '())
+                       (define result (Resyntax-Result 0 5 "new" 'test "new"))
+                       (async-channel-put release (list result))
+                       (source-controller-handle! controller (await (source-controller-events controller)))
+                       (check-equal? (with-read-doc sd doc-get-resyntax-results) (list result)))))
+      (lambda () (set-resyntax-enabled! enabled?))))
+
   (test-case "a captured Resyntax completion cannot publish or install after edit"
     (define probes (make-async-channel))
     (define started (make-async-channel))

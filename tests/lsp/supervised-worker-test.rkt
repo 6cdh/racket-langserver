@@ -21,7 +21,7 @@
                             #:done values))
 
 (module+ test
-  (test-case "completion preserves its first false result for multiple and later readers"
+  (test-case "completion delivers a false result to multiple and later readers"
     (define completion (make-completion-event))
     (define replies (make-async-channel))
     (check-true (Completion-Event? completion))
@@ -29,7 +29,6 @@
     (for ([_ (in-range 4)])
       (thread (lambda () (async-channel-put replies (sync completion)))))
     (resolve-completion! completion #f)
-    (resolve-completion! completion 'replacement)
     (for ([_ (in-range 4)])
       (check-false (await replies)))
     (check-true (evt-ready? completion))
@@ -37,16 +36,16 @@
     (check-true (evt-ready? (ready-evt #f)))
     (check-false (await (ready-evt #f))))
 
-  (test-case "a dead worker's queued false result wins over premature exit"
+  (test-case "a dead worker's queued result wins over premature exit"
     (define events (make-async-channel))
     (define handle
-      (start events (lambda () #f)
+      (start events (lambda () "source text")
              #:launch (lambda (thunk)
                         (define worker (thread thunk))
                         (await (thread-dead-evt worker))
                         worker)))
     (check-true (Supervised-Worker? handle))
-    (check-false (await events))
+    (check-equal? (await events) "source text")
     (stop-supervised-worker! handle))
 
   (test-case "raised values become failures"

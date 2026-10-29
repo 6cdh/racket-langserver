@@ -1,6 +1,6 @@
 #lang racket/base
 
-;; A single owner resolves the event; any number of waiters receive its first value.
+;; A single owner resolves the event once; any number of waiters receive its value.
 (provide Completion-Event? make-completion-event resolve-completion! ready-evt evt-ready?)
 
 (struct Completion-Event (result ready)
@@ -13,9 +13,8 @@
   (Completion-Event (box #f) (make-semaphore 0)))
 
 (define (resolve-completion! completion result)
-  (unless (evt-ready? (semaphore-peek-evt (Completion-Event-ready completion)))
-    (set-box! (Completion-Event-result completion) result)
-    (semaphore-post (Completion-Event-ready completion))))
+  (set-box! (Completion-Event-result completion) result)
+  (semaphore-post (Completion-Event-ready completion)))
 
 (define (ready-evt value)
   (wrap-evt always-evt (lambda (_) value)))

@@ -33,7 +33,6 @@
          source-controller-acquire-analysis!
          source-controller-current-view?
          source-controller-handle-completion!
-         source-controller-cancel-ineligible-analysis!
          source-controller-open!
          source-controller-edit!
          source-controller-close!
@@ -42,7 +41,6 @@
          source-controller-shutdown!
          source-controller-view
          source-controller-snapshot
-         source-controller-ensure-analysis!
          source-controller-refresh-analysis!
          (struct-out Analysis-Handle)
          (struct-out Source-Result)
@@ -174,15 +172,11 @@
                         (lambda (view result) (accept-disk-observation! controller view result)))]
     [(? Analysis-Completed?)
      (finish-analysis-task! (Source-Controller-scheduler controller) event
-                            (lambda (snapshot kind completion parent result)
-                              (accept-analysis-result! controller snapshot kind completion parent result)))]))
+                            (lambda (snapshot kind completion result)
+                              (accept-analysis-result! controller snapshot kind completion result)))]))
 
 (define (source-controller-current-view? controller view)
   (eq? view (source-controller-view controller (Source-View-source view))))
-
-(define (source-controller-cancel-ineligible-analysis! controller)
-  (cancel-ineligible-analysis! (Source-Controller-scheduler controller)
-                               (lambda (snapshot) (snapshot-current? controller snapshot))))
 
 (define (source-controller-observe! controller source)
   (match (source-controller-view controller source)
@@ -216,38 +210,39 @@
       (with-read-safedoc buffer SafeDoc-available)
       (find-closed-analysis! (Source-Controller-closed-analysis controller) snapshot)))
 
-(define (reusable-completion controller snapshot)
-  (define available (available-analysis controller snapshot))
+(define (reusable-completion available snapshot)
   (and available
        (eq? (Source-Snapshot-revision snapshot)
             (Source-Snapshot-revision (Available-Analysis-snapshot available)))
        (Available-Analysis-completion-evt available)))
 
-(define (source-controller-ensure-analysis! controller snapshot #:refresh? [refresh? #f])
+(define (prepare-analysis! controller snapshot refresh?)
   (cond
     [(or (source-controller-stopped? controller) (not (snapshot-current? controller snapshot)))
-     (ready-evt (Analysis-Outcome 'stopped 'ineligible))]
+     (values (ready-evt (Analysis-Outcome 'stopped 'ineligible)) #f)]
     [else
      (define source (Source-Snapshot-source snapshot))
      (define scheduler (Source-Controller-scheduler controller))
      (define active (scheduled-analysis-event scheduler source))
-     (define reused (and (not refresh?) (not active) (reusable-completion controller snapshot)))
+     (define available (and (not refresh?) (available-analysis controller snapshot)))
+     (define reused (and (not refresh?) (not active) (reusable-completion available snapshot)))
      (define event (or reused (request-analysis! scheduler snapshot)))
      (define buffer (source-buffer controller source))
      (when buffer
        (with-write-safedoc buffer (lambda (sd) (set-SafeDoc-analysis-completion! sd event))))
-     (source-controller-cancel-ineligible-analysis! controller)
-     event]))
+     (values event available)]))
 
 (define (source-controller-acquire-analysis! controller snapshot)
-  (define event (source-controller-ensure-analysis! controller snapshot))
-  (define available (and (not (evt-ready? event)) (available-analysis controller snapshot)))
+  (define-values (event candidate) (prepare-analysis! controller snapshot #f))
+  (define available (and (not (evt-ready? event)) candidate))
   (Analysis-Handle
     (and available (Analysis-Product-summary (Available-Analysis-product available))) event))
 
 (define (source-controller-refresh-analysis! controller source)
   (define snapshot (source-controller-snapshot controller source))
-  (when snapshot (source-controller-ensure-analysis! controller snapshot #:refresh? #t))
+  (when snapshot
+    (prepare-analysis! controller snapshot #t)
+    (void))
   (void))
 
 (define (discard-analysis! controller source)
@@ -259,12 +254,6 @@
 (define (record-analysis! controller snapshot product completion)
   (define source (Source-Snapshot-source snapshot))
   (define succeeded? (Analysis-Product-succeeded? product))
-  (define contribution (Analysis-Product-contribution product))
-  ;; Validate injected executor products at acceptance for both destinations.
-  (when (and succeeded?
-             (not (and (Analysis-Product-summary product)
-                       (if (source-file-path source) contribution (not contribution)))))
-    (error 'record-analysis! "successful analysis requires facts and a file-only contribution"))
   (define buffer (source-buffer controller source))
   (cond
     [buffer
@@ -279,7 +268,7 @@
 
 ;; A handled acceptance failure clears exact eligibility before the scheduler
 ;; broadcasts failure. Mutable traces are never returned to request threads.
-(define (accept-analysis-result! controller snapshot kind completion parent result)
+(define (accept-analysis-result! controller snapshot kind completion result)
   (define source (Source-Snapshot-source snapshot))
   (define outcome
     (with-handlers ([(lambda (_) #t) (lambda (reason) (Analysis-Outcome 'failed reason))])
@@ -289,17 +278,16 @@
         [(eq? kind 'check-syntax) (record-analysis! controller snapshot result completion)]
         [else
          (define buffer (source-buffer controller source))
-         (when buffer
-           (with-write-safedoc buffer
-             (lambda (sd)
-               (publish-document-resyntax! (Source-Controller-publisher controller) sd parent result))))
+         (with-write-safedoc buffer
+           (lambda (sd)
+             (publish-document-resyntax! (Source-Controller-publisher controller) sd result)))
          (Analysis-Outcome 'succeeded #f)])))
   (define succeeded? (eq? 'succeeded (Analysis-Outcome-state outcome)))
   (case kind
     [(check-syntax)
      (unless succeeded? (discard-analysis! controller source))
      (when (and succeeded? (source-buffer controller source) (get-resyntax-enabled))
-       (schedule-resyntax! (Source-Controller-scheduler controller) snapshot completion))]
+       (schedule-resyntax! (Source-Controller-scheduler controller) snapshot))]
     [(resyntax)
      (unless succeeded? (log-racket-langserver-info "Resyntax discarded: ~v" outcome))])
   outcome)
@@ -369,6 +357,7 @@
       (lambda (sd)
         (define available (SafeDoc-available sd))
         (define closed-view (source-store-close! (Source-Controller-store controller) source))
+        (cancel-source-analysis! (Source-Controller-scheduler controller) source)
         (when (and closed-view available
                    (eq? (Source-Snapshot-revision (Available-Analysis-snapshot available))
                         (Source-View-revision (SafeDoc-source-view sd))))
@@ -377,12 +366,8 @@
         (set-SafeDoc-source-view! sd #f)
         (clear-analysis-projections! sd)
         (Doc-uri (SafeDoc-doc sd)))))
-  (cancel-source-analysis! (Source-Controller-scheduler controller) source)
   (withdraw-document-analysis! (Source-Controller-publisher controller) source uri)
-  (cancel-read! controller source)
-  ;; This source's pool tasks were cancelled above. Sweep other sources whose
-  ;; snapshots this close made obsolete.
-  (source-controller-cancel-ineligible-analysis! controller))
+  (cancel-read! controller source))
 
 ;; Files only. Drop retained data and cached disk text. An open buffer keeps
 ;; its document, gets a new revision, and is re-analyzed. A file without a
@@ -400,10 +385,7 @@
         (source-store-invalidate! store source))
     (cancel-source-analysis! (Source-Controller-scheduler controller) source)
     (cancel-read! controller source)
-    (when buffer (source-controller-refresh-analysis! controller source))
-    ;; This source's obsolete pool tasks were cancelled above. Sweep other
-    ;; sources whose snapshots this invalidation made obsolete.
-    (source-controller-cancel-ineligible-analysis! controller)))
+    (when buffer (source-controller-refresh-analysis! controller source))))
 
 ;; Subsystems settle their own pending work. Shutdown does not inspect tables,
 ;; queues, attempts, workers, or completion-event representations.

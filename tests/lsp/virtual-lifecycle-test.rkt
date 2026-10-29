@@ -14,7 +14,7 @@
 (define text "#lang racket/base\n(require racket/list)\n(define value (first '(1 2)))\nvalue\n")
 
 (define (start-analysis controller source)
-  (source-controller-ensure-analysis! controller (source-controller-snapshot controller source)))
+  (acquire-snapshot controller (source-controller-snapshot controller source)))
 
 (module+ test
   (test-case "virtual close invalidates waiters and rejects late completion after reopen"
@@ -28,7 +28,7 @@
     (source-controller-open! controller source old)
     (define previous (source-controller-view controller source))
     (define old-snapshot (source-controller-snapshot controller source))
-    (define waiting (start-analysis controller source))
+    (define waiting (with-read-safedoc old SafeDoc-analysis-completion))
     ;; This wait includes cold worker initialization under parallel test load.
     (define late-message (await (source-controller-events controller) 30))
     (source-controller-close! controller source old)
@@ -36,7 +36,7 @@
     (check-false (source-controller-view controller source))
     (check-false (source-controller-snapshot controller source))
     (check-eq? 'stopped (Analysis-Outcome-state (await waiting)))
-    (check-equal? (await (source-controller-ensure-analysis! controller old-snapshot))
+    (check-equal? (await (acquire-snapshot controller old-snapshot))
                   (Analysis-Outcome 'stopped 'ineligible))
     (source-controller-handle! controller late-message)
     (check-false (source-controller-view controller source))
@@ -49,11 +49,11 @@
                   (Source-View-id (source-controller-view controller source)))
     (check-not-eq? (Source-View-revision previous)
                    (Source-View-revision (source-controller-view controller source)))
-    (check-equal? (await (source-controller-ensure-analysis! controller old-snapshot))
-                  (Analysis-Outcome 'stopped 'ineligible))
     (source-controller-handle! controller late-message)
     (check-equal? (length published) 1 "only close clears diagnostics")
     (check-false (with-read-doc reopened doc-trace-latest?))
+    (check-equal? (await (acquire-snapshot controller old-snapshot))
+                  (Analysis-Outcome 'stopped 'ineligible))
     (check-eq? 'succeeded
                (Analysis-Outcome-state
                  (drive-controller controller (start-analysis controller source))))
