@@ -68,29 +68,53 @@
   (void))
 
 (define (apply-langserver-settings settings)
-  (match-define (Langserver-Settings #:resyntax resyntax #:formatting formatting)
+  (match-define (Langserver-Settings #:resyntax resyntax
+                                     #:formatting formatting
+                                     #:analysis analysis)
     settings)
-  (set-resyntax-enabled!
-    (match resyntax
-      [(Resyntax-Settings #:enable (and enable (not (? Nothing?)))) enable]
-      [_ default-resyntax-enabled]))
+  (source-controller-configure-analysis! (current-source-controller)
+                                         (resolve-analysis-settings analysis))
+  (set-resyntax-enabled! (resolve-resyntax-settings resyntax))
+  (set-formatting-settings! (resolve-formatting-settings formatting)))
+
+(define (resolve-analysis-settings analysis)
+  (match analysis
+    [(Analysis-Configuration #:task-timeout task
+                             #:request-timeout request
+                             #:workers workers
+                             #:closed-file-cache-size cache-size)
+     (define defaults default-analysis-settings)
+     (define (configured value default)
+       (if (Nothing? value) default value))
+     (Analysis-Settings
+       (configured task (Analysis-Settings-task-timeout defaults))
+       (configured request (Analysis-Settings-request-timeout defaults))
+       (configured workers (Analysis-Settings-workers defaults))
+       (configured cache-size (Analysis-Settings-closed-file-cache-size defaults)))]
+    [_ default-analysis-settings]))
+
+(define (resolve-resyntax-settings resyntax)
+  (match resyntax
+    [(Resyntax-Settings #:enable (and enable (not (? Nothing?)))) enable]
+    [_ default-resyntax-enabled]))
+
+(define (resolve-formatting-settings formatting)
   (match formatting
     [(Formatting-Configuration
        #:document-formatter document-formatter
        #:indentation-formatter indentation-formatter
        #:fmt-settings fmt-settings)
-     (set-formatting-settings!
-       (Formatting-Settings
-         (if (Nothing? document-formatter)
-             (Formatting-Settings-document-formatter default-formatting-settings)
-             (Document-Formatter-v document-formatter))
-         (if (Nothing? indentation-formatter)
-             (Formatting-Settings-indentation-formatter default-formatting-settings)
-             (Indentation-Formatter-v indentation-formatter))
-         (if (Nothing? fmt-settings)
-             (Formatting-Settings-fmt-settings default-formatting-settings)
-             fmt-settings)))]
-    [_ (set-formatting-settings! default-formatting-settings)]))
+     (Formatting-Settings
+       (if (Nothing? document-formatter)
+           (Formatting-Settings-document-formatter default-formatting-settings)
+           (Document-Formatter-v document-formatter))
+       (if (Nothing? indentation-formatter)
+           (Formatting-Settings-indentation-formatter default-formatting-settings)
+           (Indentation-Formatter-v indentation-formatter))
+       (if (Nothing? fmt-settings)
+           (Formatting-Settings-fmt-settings default-formatting-settings)
+           fmt-settings))]
+    [_ default-formatting-settings]))
 
 (define (normalize-configuration-item item)
   (if (eq? item (json-null))
@@ -112,7 +136,8 @@
 
 (define client-capability-workspace/configuration? (make-parameter #f))
 
-;; `scopeUri` is optional; the callback applies process-wide either way.
+;; `scopeUri` is optional; analysis settings apply to the session controller,
+;; while formatting and Resyntax keep their process-wide storage.
 (define (fetch-configuration request-client [uri (Nothing)])
   (when (client-capability-workspace/configuration?)
     (request-client "workspace/configuration"

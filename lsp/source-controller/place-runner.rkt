@@ -4,7 +4,7 @@
 ;;
 ;; Each runner manages background analysis for one analysis kind ('check-syntax or 'resyntax).
 ;; The pool manager thread serializes admission, maintains a FIFO queue of pending tasks,
-;; schedules work to a fixed number of execution slots, enforces task and watchdog deadlines,
+;; schedules work to a configurable number of execution slots, enforces task and watchdog deadlines,
 ;; and supervises parent-thread result restoration.
 ;;
 ;; Logical settlement and physical reservation are decoupled:
@@ -57,6 +57,8 @@
                  Place-Task?)]
            [cancel-place-task!
             (-> Place-Task? void?)]
+           [resize-place-runner!
+            (-> Place-Runner? exact-positive-integer? void?)]
            [stop-place-runner!
             (-> Place-Runner? void?)]
            [place-runner-shutdown-evt
@@ -141,7 +143,8 @@
 ;; Private mutable pool state managed exclusively by the manager thread.
 ;;
 ;; kind: Analysis kind ('check-syntax or 'resyntax) used by every worker in this pool.
-;; slots: Fixed list of capacity slots governed by this pool.
+;; slots: Admission slots followed by excess slots draining after a capacity reduction.
+;; slot-limit: Desired admission capacity; excess slots get no new assignments.
 ;; task-queue: FIFO queue of Place-Task submissions waiting for an assignable slot.
 ;; active-tasks: Hash set of all active tasks currently tracked by this pool.
 ;; owner-custodian: Session custodian under which slot custodians and cleanup helpers are rooted.
@@ -156,7 +159,8 @@
 ;; assignment-counter: Sequence counter generating unique assignment IDs across worker reuse.
 (struct/contract Pool
   ([kind (or/c 'check-syntax 'resyntax)]
-   [slots (listof Slot?)]
+   [(slots #:mutable) (listof Slot?)]
+   [(slot-limit #:mutable) exact-positive-integer?]
    [task-queue queue?]
    [active-tasks (hash/c Place-Task? boolean? #:immutable #f)]
    [owner-custodian custodian?]
@@ -179,6 +183,10 @@
   ([task Place-Task?])
   #:transparent)
 
+(struct/contract Pool-Resize
+  ([slots exact-positive-integer?])
+  #:transparent)
+
 (struct/contract Pool-Stop ()
   #:transparent)
 
@@ -198,7 +206,7 @@
   #:transparent)
 
 (struct/contract Pool-Command
-  ([command (or/c Pool-Submit? Pool-Cancel? Pool-Stop?)])
+  ([command (or/c Pool-Submit? Pool-Cancel? Pool-Resize? Pool-Stop?)])
   #:transparent)
 
 (define (failure-outcome reason)
@@ -237,6 +245,7 @@
     (Pool kind
           (for/list ([_ (in-range slot-count)])
             (Slot #f #f 'empty #f #f #f #f))
+          slot-count
           (make-queue) (make-hasheq)
           (current-custodian)
           guard factory
@@ -298,6 +307,13 @@
     (lambda ()
       (unless (Place-Runner-stopped? runner)
         (async-channel-put (Place-Runner-commands runner) (Pool-Cancel task))))))
+
+(define (resize-place-runner! runner slots)
+  (call-with-semaphore
+    (Place-Runner-gate runner)
+    (lambda ()
+      (unless (Place-Runner-stopped? runner)
+        (async-channel-put (Place-Runner-commands runner) (Pool-Resize slots))))))
 
 (define (stop-place-runner! runner)
   (call-with-semaphore
@@ -517,11 +533,26 @@
                                      (Pool-startup-watchdog-ms pool)))
      (spawn-slot-worker! pool slot)]))
 
+;; Keep busy excess slots observable until their task and cleanup finish. Idle
+;; excess workers retire asynchronously; only empty excess slots can be forgotten.
+(define (retire-excess-slots! pool)
+  (define limit (Pool-slot-limit pool))
+  (when (> (length (Pool-slots pool)) limit)
+    (set-Pool-slots!
+      pool
+      (for/list ([slot (in-list (Pool-slots pool))] [index (in-naturals)]
+                 #:unless (and (>= index limit) (eq? (Slot-phase slot) 'empty)))
+        (when (and (>= index limit) (eq? (Slot-phase slot) 'idle))
+          (retire-slot-worker! pool slot))
+        slot))))
+
 (define (assign-queued-tasks! pool)
-  (for ([slot (in-list (Pool-slots pool))]
-        #:when (memq (Slot-phase slot) '(empty idle))
-        #:break (queue-empty? (Pool-task-queue pool)))
-    (assign-task-to-slot! pool slot (dequeue! (Pool-task-queue pool)))))
+  (unless (queue-empty? (Pool-task-queue pool))
+    (for ([slot (in-list (Pool-slots pool))]
+          [_ (in-range (Pool-slot-limit pool))]
+          #:when (memq (Slot-phase slot) '(empty idle))
+          #:break (queue-empty? (Pool-task-queue pool)))
+      (assign-task-to-slot! pool slot (dequeue! (Pool-task-queue pool))))))
 
 (define (dispatch-worker-message! pool slot message)
   (define task (Slot-task slot))
@@ -648,6 +679,15 @@
     [(Pool-Cancel task)
      (cancel-pool-task! pool task (Analysis-Outcome 'stopped 'cancelled))]
 
+    [(Pool-Resize slots)
+     (set-Pool-slot-limit! pool slots)
+     (set-Pool-slots!
+       pool
+       (append (Pool-slots pool)
+               (for/list ([_ (in-range (length (Pool-slots pool)) slots)])
+                 (Slot #f #f 'empty #f #f #f #f))))
+     (retire-excess-slots! pool)]
+
     [(Pool-Stop)
      (set-Pool-stopped?! pool #t)
      (for ([task (in-list (hash-keys (Pool-active-tasks pool)))])
@@ -662,6 +702,7 @@
     ;; Timers precede assignment, even when an external command won the previous sync.
     (enforce-pool-deadlines! pool)
     (unless (Pool-stopped? pool)
+      (retire-excess-slots! pool)
       (assign-queued-tasks! pool))
 
     (unless (and (Pool-stopped? pool)

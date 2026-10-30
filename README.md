@@ -90,6 +90,12 @@ project configuration file. **Ignore** vscode warning of `Unknown Configuration 
 ```jsonc
 {
   "racket-langserver": {
+    "analysis": {
+      "taskTimeout": 90, // seconds (1-600)
+      "requestTimeout": 30, // seconds (0.01-120)
+      "workers": 2, // Check Syntax worker places (1-128)
+      "closedFileCacheSize": 64 // retained closed-file entries (0-1024, 0 disables)
+    },
     "resyntax": {
       "enable": true
     },
@@ -110,6 +116,21 @@ Settings apply to the whole language-server process. A `racket-langserver`
 section is a snapshot: omitted keys use shipped defaults, so removing
 formatter configuration returns both backends to `fixw`. Unknown values are
 ignored.
+
+### Analysis
+
+| Name | Default | Allowed values and meaning |
+| ---- | ------- | -------------------------- |
+| `analysis.taskTimeout` | `90` | **1–600 seconds**. Timeout for background analysis (Check Syntax and Resyntax). |
+| `analysis.requestTimeout` | `30` | **0.01–120 seconds**. Timeout for editor requests such as hover and definition lookups. |
+| `analysis.workers` | `2` | **1–128**. Number of background worker places (using [`racket/place`](https://docs.racket-lang.org/reference/places.html)) for Check Syntax. |
+| `analysis.closedFileCacheSize` | `64` | **0–1024**. Maximum number of closed files whose analysis results are cached. Set to `0` to disable caching. |
+
+Settings apply live without restarting the server. Omitted keys reset to defaults. Invalid values or malformed settings are ignored, preserving previous settings.
+
+**Tuning suggestions:**
+- **Low memory:** Set `analysis.workers` to `1` and reduce or disable `analysis.closedFileCacheSize` (e.g. `0` or `16`). Each worker place uses [`racket/place`](https://docs.racket-lang.org/reference/places.html) with its own isolated heap; running a single worker and clearing closed-file caching significantly reduces memory usage on large projects. You can also disable Resyntax (`resyntax.enable: false`) to avoid running an additional worker place.
+- **Better throughput:** Increase `analysis.workers` (e.g. `4` or higher on multi-core systems) to allow multiple files to analyze concurrently.
 
 ### Resyntax
 

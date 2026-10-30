@@ -41,6 +41,8 @@
          source-controller-shutdown!
          source-controller-view
          source-controller-snapshot
+         source-controller-configure-analysis!
+         source-controller-request-timeout
          source-controller-refresh-analysis!
          (struct-out Analysis-Handle)
          (struct-out Source-Result)
@@ -81,44 +83,71 @@
    [reader Disk-Reader?]
    [scheduler Analysis-Scheduler?]
    [closed-analysis Closed-Analysis-Cache?]
-   [publisher Analysis-Publisher?]))
+   [publisher Analysis-Publisher?]
+   [(request-timeout #:mutable) (and/c rational? positive?)]))
 
 ;; Timeouts are seconds. The workspace supplies publication only, not session
 ;; isolation for request-layer workspace access. Zero cache capacity disables
 ;; closed-file retention. `#f` Resyntax disables its follow-on work.
-(define (make-source-controller #:workspace [workspace current-workspace]
-                                #:read [read read-source-text]
-                                #:read-timeout [read-timeout 3]
-                                ;; `#f` uses production Check Syntax. A procedure is a
-                                ;; local injected task in that pool, under the task custodian.
-                                #:analyze [analyze #f]
-                                ;; Check Syntax slot count. Resyntax always has one slot.
-                                #:analysis-slots [slots 2]
-                                #:analysis-timeout [analysis-timeout 90]
-                                ;; Wraps place creation in both pools. Stdio pauses the
-                                ;; stdin reader; the default calls `thunk` unchanged.
-                                #:place-start-guard [place-start-guard (lambda (thunk) (thunk))]
-                                #:closed-analysis-limit [closed-analysis-limit 64]
-                                #:resyntax [resyntax (and (resyntax-collection-present?) 'place)])
+(define (make-source-controller
+          #:workspace [workspace current-workspace]
+          #:read [read read-source-text]
+          #:read-timeout [read-timeout 3]
+          ;; `#f` uses production Check Syntax. A procedure is a
+          ;; local injected task in that pool, under the task custodian.
+          #:analyze [analyze #f]
+          ;; Check Syntax slot count. Resyntax always has one slot.
+          #:analysis-slots [slots (Analysis-Settings-workers default-analysis-settings)]
+          #:analysis-timeout [analysis-timeout (Analysis-Settings-task-timeout default-analysis-settings)]
+          #:request-timeout [request-timeout (Analysis-Settings-request-timeout default-analysis-settings)]
+          ;; Wraps place creation in both pools. Stdio pauses the
+          ;; stdin reader; the default calls `thunk` unchanged.
+          #:place-start-guard [place-start-guard (lambda (thunk) (thunk))]
+          #:closed-analysis-limit [closed-analysis-limit
+                                   (Analysis-Settings-closed-file-cache-size
+                                     default-analysis-settings)]
+          #:resyntax [resyntax (and (resyntax-collection-present?) 'place)])
   (make-source-controller/with-scheduler
     (lambda (events)
       (make-analysis-scheduler events #:analyze analyze #:resyntax resyntax
                                #:slots slots #:timeout analysis-timeout
                                #:place-start-guard place-start-guard))
     #:workspace workspace #:read read #:read-timeout read-timeout
+    #:request-timeout request-timeout
     #:closed-analysis-limit closed-analysis-limit))
 
-(define (make-source-controller/with-scheduler make-scheduler
-                                               #:workspace [workspace current-workspace]
-                                               #:read [read read-source-text]
-                                               #:read-timeout [read-timeout 3]
-                                               #:closed-analysis-limit [closed-analysis-limit 64])
+(define (make-source-controller/with-scheduler
+          make-scheduler
+          #:workspace [workspace current-workspace]
+          #:read [read read-source-text]
+          #:read-timeout [read-timeout 3]
+          #:request-timeout [request-timeout
+                             (Analysis-Settings-request-timeout
+                               default-analysis-settings)]
+          #:closed-analysis-limit [closed-analysis-limit
+                                   (Analysis-Settings-closed-file-cache-size
+                                     default-analysis-settings)])
   (define events (make-async-channel))
   (Source-Controller (make-source-store) events (make-semaphore 0)
                      (make-disk-reader events #:read read #:timeout read-timeout)
                      (make-scheduler events)
                      (make-closed-analysis-cache closed-analysis-limit)
-                     (make-analysis-publisher workspace)))
+                     (make-analysis-publisher workspace)
+                     request-timeout))
+
+(define source-controller-request-timeout Source-Controller-request-timeout)
+
+;; Consumer-only updates. Existing attempts keep their absolute deadlines.
+(define/contract (source-controller-configure-analysis! controller settings)
+  (-> Source-Controller? Analysis-Settings? void?)
+  (unless (source-controller-stopped? controller)
+    (configure-analysis-scheduler! (Source-Controller-scheduler controller)
+                                   (Analysis-Settings-task-timeout settings)
+                                   (Analysis-Settings-workers settings))
+    (resize-closed-analysis-cache! (Source-Controller-closed-analysis controller)
+                                   (Analysis-Settings-closed-file-cache-size settings))
+    (set-Source-Controller-request-timeout! controller
+                                            (Analysis-Settings-request-timeout settings))))
 
 (define current-source-controller (make-parameter (make-source-controller)))
 

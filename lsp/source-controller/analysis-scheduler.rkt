@@ -18,6 +18,7 @@
 
 (provide Analysis-Scheduler?
          make-analysis-scheduler
+         configure-analysis-scheduler!
          scheduled-analysis-event
          request-analysis!
          schedule-resyntax!
@@ -62,7 +63,7 @@
    [check-syntax-runner Place-Runner?]
    [resyntax-runner Place-Runner?]
    [resyntax (or/c #f 'place (-> string? string? list?))]
-   [timeout (and/c real? (>=/c 0))]
+   [(timeout #:mutable) (and/c rational? (>=/c 0))]
    [attempts (hash/c (cons/c Source-Id? (or/c 'check-syntax 'resyntax))
                      Analysis-Attempt? #:immutable #f)]))
 
@@ -87,6 +88,10 @@
   (Analysis-Scheduler events analyze check-runner resyntax-runner
                       resyntax timeout (make-hash)))
 
+(define (configure-analysis-scheduler! scheduler timeout slots)
+  (set-Analysis-Scheduler-timeout! scheduler timeout)
+  (resize-place-runner! (Analysis-Scheduler-check-syntax-runner scheduler) slots))
+
 (define (attempt-key attempt)
   (cons (Source-Snapshot-id (Analysis-Attempt-snapshot attempt))
         (Analysis-Attempt-kind attempt)))
@@ -101,7 +106,7 @@
 
 (define (enqueue! scheduler snapshot kind)
   (define deadline
-    (+ (current-deadline-milliseconds) (* 1000 (Analysis-Scheduler-timeout scheduler))))
+    (deadline-after-seconds (Analysis-Scheduler-timeout scheduler)))
   (define attempt
     (Analysis-Attempt snapshot kind (make-completion-event) deadline #f))
   (hash-set! (Analysis-Scheduler-attempts scheduler) (attempt-key attempt) attempt)

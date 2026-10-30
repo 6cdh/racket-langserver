@@ -64,7 +64,7 @@
 
 ;; Both initialized feature tests and injected-controller tests run the production consumer.
 (define (with-session controller proc
-                      #:request-timeout [timeout (current-analysis-request-timeout)])
+                      #:request-timeout [timeout #f])
   (define custodian (make-custodian))
   (define clients (make-async-channel))
   (define responses (make-async-channel))

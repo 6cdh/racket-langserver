@@ -97,6 +97,32 @@
                     (close! session path)
                     (barrier session))))
 
+  (test-case "pushed cache limit clears retained analyses while open documents stay available"
+    (define gates (make-async-channel))
+    (define text "#lang racket/base\n(define value 1)\nvalue\n")
+    (with-session (make-source-controller #:analyze (analyzer gates) #:resyntax #f)
+                  (lambda (session)
+                    (define live (build-path scratch "cache-settings-live.rkt"))
+                    (define closed (build-path scratch "cache-settings-closed.rkt"))
+                    (open-analyzed! session gates live text)
+                    (open-analyzed! session gates closed text)
+                    (close! session closed)
+                    (barrier session)
+                    (notify session "workspace/didChangeConfiguration"
+                            (hasheq 'settings
+                                    (hasheq 'racket-langserver
+                                            (hasheq 'analysis (hasheq 'closedFileCacheSize 0)))))
+                    (barrier session)
+                    (check-true
+                      (pair? (hash-ref (query session live 419 "textDocument/semanticTokens/full")
+                                       'data)))
+                    (open! session closed text)
+                    (define held (await gates))
+                    (barrier session)
+                    (check-false (available session closed))
+                    (release-gate! held)
+                    (await-analysis (acquire session closed)))))
+
   (test-case "cache eviction leaves live documents usable and makes an evicted reopen cold"
     (define gates (make-async-channel))
     (define text "#lang racket/base\n(define value 1)\nvalue\n")

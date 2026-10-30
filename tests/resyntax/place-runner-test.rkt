@@ -72,6 +72,42 @@
   (define (check-stopped event)
     (check-eq? (Analysis-Outcome-state (await event)) 'stopped))
 
+  (test-case "live resizing drains excess workers and grows without cancelling tasks"
+    (with-runner
+      (lambda (runner events spawned _new-runner)
+        (start runner events)
+        (define-values (worker-a control-a) (await-worker spawned))
+        (await control-a)
+        (start runner events)
+        (define-values (worker-b control-b) (await-worker spawned))
+        (await control-b)
+        (resize-place-runner! runner 1)
+        (start runner events)
+        (finish! control-b)
+        (check-equal? (await events) #hasheq())
+        ;; Retirement is an observable receipt of the shrink command. Slot A
+        ;; is still busy, so the queued task must not be assigned to slot B.
+        (await (place-dead-evt worker-b))
+        (check-false (sync/timeout 0 spawned))
+        (finish! control-a)
+        (check-equal? (await events) #hasheq())
+        (await control-a) ; the queued task reuses the surviving worker
+        (resize-place-runner! runner 128)
+        (start runner events)
+        (start runner events)
+        (define-values (worker-c control-c) (await-worker spawned))
+        (define-values (worker-d control-d) (await-worker spawned))
+        (await control-c)
+        (await control-d)
+        (for ([control (in-list (list control-a control-c control-d))])
+          (finish! control))
+        (for ([_ (in-range 3)])
+          (check-equal? (await events) #hasheq()))
+        (resize-place-runner! runner 1)
+        (await (place-dead-evt worker-c))
+        (await (place-dead-evt worker-d)))
+      #:slots 2))
+
   (test-case "the configured factory creates each cold slot"
     (with-runner
       (lambda (runner events spawned _new-runner)

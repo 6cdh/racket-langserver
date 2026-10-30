@@ -16,8 +16,7 @@
 (provide definition-query)
 
 (define (definition-query safe-doc id uri pos)
-  (define deadline (+ (current-deadline-milliseconds)
-                      (* 1000 (current-analysis-request-timeout))))
+  (define deadline (deadline-after-seconds (current-analysis-request-timeout)))
   (define controller (current-source-controller))
   (define-values (view target)
     (with-read-safedoc safe-doc

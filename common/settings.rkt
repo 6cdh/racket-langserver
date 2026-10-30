@@ -3,7 +3,9 @@
 (require racket/contract
          "interfaces.rkt")
 
-(provide get-resyntax-enabled
+(provide (struct-out Analysis-Settings)
+         default-analysis-settings
+         get-resyntax-enabled
          set-resyntax-enabled!
          default-resyntax-enabled
          (struct-out Formatting-Settings)
@@ -39,3 +41,13 @@
 (define/contract (set-formatting-settings! settings)
   (-> Formatting-Settings? void?)
   (set! current-formatting-settings settings))
+
+;; Seconds for each budget, Check Syntax capacity, and retained closed-file entry count.
+(struct/contract Analysis-Settings
+  ([task-timeout analysis-task-timeout?]
+   [request-timeout analysis-request-timeout?]
+   [workers analysis-worker-count?]
+   [closed-file-cache-size analysis-cache-size?])
+  #:transparent)
+
+(define default-analysis-settings (Analysis-Settings 90 30 2 64))

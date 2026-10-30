@@ -18,8 +18,7 @@
 (provide hover-query)
 
 (define (hover-query safe-doc id pos)
-  (define deadline (+ (current-deadline-milliseconds)
-                      (* 1000 (current-analysis-request-timeout))))
+  (define deadline (deadline-after-seconds (current-analysis-request-timeout)))
   (define controller (current-source-controller))
   (define-values (view target card range)
     (with-read-safedoc safe-doc

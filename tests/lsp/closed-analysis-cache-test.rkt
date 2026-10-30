@@ -98,6 +98,25 @@
     (store-closed-analysis! cache c)
     (check-eq? (take-closed-analysis! cache c-source) c))
 
+  (test-case "shrinking keeps recent entries, zero clears, and growing permits retention"
+    (define cache (make-closed-analysis-cache 3))
+    (for ([analysis (in-list (list a b c))])
+      (store-closed-analysis! cache analysis))
+    (check-eq? (find-closed-analysis! cache a-snapshot) a)
+    (resize-closed-analysis-cache! cache 1)
+    (check-false (find-closed-analysis! cache b-snapshot))
+    (check-false (find-closed-analysis! cache c-snapshot))
+    (check-eq? (find-closed-analysis! cache a-snapshot) a)
+    (resize-closed-analysis-cache! cache 0)
+    (check-false (find-closed-analysis! cache a-snapshot))
+    (store-closed-analysis! cache b)
+    (check-false (find-closed-analysis! cache b-snapshot))
+    (resize-closed-analysis-cache! cache 2)
+    (store-closed-analysis! cache b)
+    (store-closed-analysis! cache c)
+    (check-eq? (find-closed-analysis! cache b-snapshot) b)
+    (check-eq? (find-closed-analysis! cache c-snapshot) c))
+
   (test-case "zero capacity retains nothing"
     (define cache (make-closed-analysis-cache 0))
     (for ([analysis (in-list (list a b c))])

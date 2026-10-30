@@ -23,7 +23,18 @@
 (provide analysis-query current-analysis-request-timeout)
 
 ;; Seconds allowed for one query, measured from the call to `analysis-query`.
-(define current-analysis-request-timeout (make-parameter 30))
+;; An explicit parameter value overrides session configuration for embedded callers/tests.
+(define current-analysis-request-timeout
+  (make-derived-parameter
+    (make-parameter #f)
+    (lambda (override)
+      (unless (or (not override) (and (rational? override) (>= override 0)))
+        (raise-argument-error 'current-analysis-request-timeout
+                              "(or/c #f (and/c rational? (>=/c 0)))"
+                              override))
+      override)
+    (lambda (override)
+      (or override (source-controller-request-timeout (current-source-controller))))))
 
 (define (analysis-failed-response request-id message reason)
   (log-racket-langserver-info "Analysis request ~a failed: ~a: ~v" request-id message reason)
@@ -58,8 +69,7 @@
           response-or-completion))))
 
 (define (analysis-query safe-doc request-id read-result empty-result)
-  (define deadline-ms (+ (current-deadline-milliseconds)
-                         (* 1000 (current-analysis-request-timeout))))
+  (define deadline-ms (deadline-after-seconds (current-analysis-request-timeout)))
   (define shutdown-evt (source-controller-shutdown-evt (current-source-controller)))
   (define-values (request-view initial-completion immediate-response)
     (with-read-safedoc safe-doc

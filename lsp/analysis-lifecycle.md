@@ -164,8 +164,8 @@ message is rejected by the reader.
 ## Place execution
 
 Check Syntax and Resyntax have separate session-owned pools. Each pool has an
-ordinary manager thread that owns its FIFO, absolute deadlines, fixed slots,
-and recovery. `#:analysis-slots` sets Check Syntax capacity, two by default;
+ordinary manager thread that owns its FIFO, absolute deadlines, configurable slots,
+and recovery. `#:analysis-slots` sets initial Check Syntax capacity, two by default;
 Resyntax has one slot. A controller can have up to three places by default.
 The controller owns the Check Syntax default; scheduler and runner constructors
 require an explicit slot count. The analysis scheduler (`source-controller/analysis-scheduler.rkt`) routes each kind
@@ -176,7 +176,8 @@ reserve Check Syntax capacity, and conversely.
 Each slot holds at most one place and stays reserved through native startup,
 library initialization, execution, transfer, parent restoration, and cleanup.
 With N Check Syntax slots, at most N Check Syntax tasks and one Resyntax task
-can execute or restore, with at most N + 1 places. A dead worker stays reserved
+can execute or restore, with at most N + 1 places, once any excess slots from a
+live capacity reduction finish draining. A dead worker stays reserved
 through parent cleanup, then retires without becoming idle. Both pools start
 places only on submission; constructing a controller creates no places. The
 Resyntax pool stays empty until accepted, successful Check Syntax for an open
@@ -439,3 +440,32 @@ are values only where a test explicitly exercises that production contract.
   whose imports fail.
 - `tests/lib/place-start-guard-test.rkt`: local guard behavior. Those tests
   do not reproduce the Racket CS hang.
+
+## Runtime analysis configuration
+
+The `analysis` keys in the `racket-langserver` configuration section are documented
+in [README.md](../README.md#analysis). The controller exists before configuration
+arrives and starts with shipped defaults. The consumer applies each valid snapshot
+through `source-controller-configure-analysis!`; it updates scheduler admission,
+closed-file retention, and the session's query budget. Absent keys restore defaults;
+invalid snapshots leave the current configuration intact. These bounds govern LSP
+configuration; embedded constructor and parameter overrides retain their own contracts.
+
+The scheduler captures `taskTimeout` as an absolute deadline only at submission,
+separately for Check Syntax and follow-on Resyntax. Query entry points read the
+controller's `requestTimeout` and capture their deadline before returning deferred
+work. The `current-analysis-request-timeout` parameter remains an explicit override
+for embedded callers and tests. Neither update rewrites a captured deadline.
+
+Worker resizing is a command on the Check Syntax pool's serialized manager queue.
+The configured maximum of 128 workers keeps empty slot records small enough to
+allocate at construction or capacity growth; physical places still start only on
+submission. Only the first configured number of slots admit new work. Excess busy slots remain
+observed through completion, cancellation, restoration, and cleanup; idle excess
+workers retire asynchronously and empty excess slots are removed. A later increase
+can reuse slots that have not retired yet, or create empty slots without starting
+places. Resyntax capacity stays one. The capacity bound is therefore eventual when
+shrinking, while all existing task and watchdog deadlines remain enforced.
+
+Cache resizing runs on the consumer, immediately evicts least recently used entries
+until the new count bound holds, and preserves open buffers and held completions.

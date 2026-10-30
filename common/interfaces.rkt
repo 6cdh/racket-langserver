@@ -49,6 +49,11 @@
          (json-type-out Indentation-Formatter)
          (json-type-out Fmt-Settings)
          (json-type-out Formatting-Configuration)
+         analysis-task-timeout?
+         analysis-request-timeout?
+         analysis-worker-count?
+         analysis-cache-size?
+         (json-type-out Analysis-Configuration)
          (json-type-out Langserver-Settings)
          (json-type-out Langserver-Settings-Update)
          (json-type-out FileRename)
@@ -262,7 +267,28 @@
   [indentation-formatter (optional Indentation-Formatter) #:json indentationFormatter]
   [fmt-settings (optional Fmt-Settings) #:json fmtSettings])
 
+;; Inclusive configuration limits shared with the resolved runtime settings.
+;; Timeouts are seconds; worker and cache limits are counts, not memory bounds.
+(define (analysis-task-timeout? value)
+  (and (rational? value) (<= 1 value 600)))
+
+(define (analysis-request-timeout? value)
+  (and (rational? value) (<= 1/100 value 120)))
+
+(define (analysis-worker-count? value)
+  (and (exact-integer? value) (<= 1 value 128)))
+
+(define (analysis-cache-size? value)
+  (and (exact-integer? value) (<= 0 value 1024)))
+
+(define-json-struct Analysis-Configuration
+  [task-timeout (optional (contract analysis-task-timeout?)) #:json taskTimeout]
+  [request-timeout (optional (contract analysis-request-timeout?)) #:json requestTimeout]
+  [workers (optional (contract analysis-worker-count?))]
+  [closed-file-cache-size (optional (contract analysis-cache-size?)) #:json closedFileCacheSize])
+
 (define-json-struct Langserver-Settings
+  [analysis (optional Analysis-Configuration)]
   [resyntax (optional Resyntax-Settings)]
   [formatting (optional Formatting-Configuration)])
 

@@ -16,6 +16,7 @@
          Source-Controller?
          current-source-controller
          source-controller-events
+         source-controller-request-timeout
          source-controller-observe-evt
          source-controller-analysis-evt
          source-controller-current-view-evt
@@ -28,7 +29,8 @@
 ;; These operations run only on the session consumer. Request threads use the
 ;; named commands above.
 (module+ owner
-  (provide source-controller-handle!
+  (provide source-controller-configure-analysis!
+           source-controller-handle!
            source-controller-open!
            source-controller-edit!
            source-controller-close!

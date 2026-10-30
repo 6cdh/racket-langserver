@@ -4,6 +4,7 @@
 ;; consumer serializes every operation, including lookups that refresh recency.
 ;; Callers establish file-only eligibility and detach live traces before insertion.
 (require racket/contract
+         racket/list
          "../../common/source.rkt"
          "../../workspace/source-store.rkt"
          "../analysis.rkt")
@@ -11,6 +12,8 @@
 (provide Closed-Analysis-Cache?
          (contract-out
            [make-closed-analysis-cache (-> exact-nonnegative-integer? Closed-Analysis-Cache?)]
+           [resize-closed-analysis-cache!
+            (-> Closed-Analysis-Cache? exact-nonnegative-integer? void?)]
            [store-closed-analysis! (-> Closed-Analysis-Cache? Available-Analysis? void?)]
            [find-closed-analysis!
             (-> Closed-Analysis-Cache? Source-Snapshot? (or/c Available-Analysis? #f))]
@@ -26,7 +29,7 @@
 ;; successful match gets a unique use-order. Eviction scans this small bounded
 ;; table rather than maintaining a separate eviction queue.
 (struct/contract Closed-Analysis-Cache
-  ([limit exact-nonnegative-integer?]
+  ([(limit #:mutable) exact-nonnegative-integer?]
    [(next-use-order #:mutable) exact-nonnegative-integer?]
    [entries (hash/c Source-Id? Cached-Analysis? #:immutable #f)]))
 
@@ -43,16 +46,33 @@
 (define (store-closed-analysis! cache analysis)
   (unless (zero? (Closed-Analysis-Cache-limit cache))
     (record-use! cache analysis)
-    (define entries (Closed-Analysis-Cache-entries cache))
-    (when (> (hash-count entries) (Closed-Analysis-Cache-limit cache))
-      (define-values (oldest-id _oldest-order)
-        (for/fold ([oldest-id #f] [oldest-order +inf.0])
-                  ([(id entry) (in-hash entries)])
-          (define order (Cached-Analysis-use-order entry))
-          (if (< order oldest-order)
-              (values id order)
-              (values oldest-id oldest-order))))
-      (hash-remove! entries oldest-id))))
+    (trim-closed-analysis-cache! cache)))
+
+(define (resize-closed-analysis-cache! cache limit)
+  (set-Closed-Analysis-Cache-limit! cache limit)
+  (define entries (Closed-Analysis-Cache-entries cache))
+  (cond
+    [(zero? limit) (clear-closed-analysis! cache)]
+    [(> (hash-count entries) limit)
+     ;; Bulk shrinking sorts once; normal insertion needs only a single scan.
+     (define oldest-first (sort (hash->list entries) <
+                                #:key (lambda (entry) (Cached-Analysis-use-order (cdr entry)))))
+     (define excess (- (hash-count entries) limit))
+     (for ([entry (in-list oldest-first)]
+           [_ (in-range excess)])
+       (hash-remove! entries (car entry)))]))
+
+(define (trim-closed-analysis-cache! cache)
+  (define entries (Closed-Analysis-Cache-entries cache))
+  (when (> (hash-count entries) (Closed-Analysis-Cache-limit cache))
+    (define-values (oldest-id _oldest-order)
+      (for/fold ([oldest-id #f] [oldest-order +inf.0])
+                ([(id entry) (in-hash entries)])
+        (define order (Cached-Analysis-use-order entry))
+        (if (< order oldest-order)
+            (values id order)
+            (values oldest-id oldest-order))))
+    (hash-remove! entries oldest-id)))
 
 ;; Close creates a new revision, so reuse compares exact text, not revisions.
 ;; Matching text does not establish freshness of imported dependencies. A miss
