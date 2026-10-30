@@ -136,3 +136,45 @@
         (place-wait resyntax-worker)
         (tcp-close listener)
         (delete-directory/files root)))))
+
+(define-runtime-path loading-worker "../fixtures/resyntax-loading-worker.rkt")
+
+(module+ test
+  (test-case "engine initialization survives startup cancellation and job cleanup in each worker"
+    (for ([_ (in-range 2)])
+      (define worker (dynamic-place loading-worker 'run))
+      (dynamic-wind
+        void
+        (lambda ()
+          (define-values (control remote) (place-channel))
+          (place-channel-put worker remote)
+          (place-channel-put worker (Place-Prepare 'resyntax))
+          (check-equal? (receive control) 'engine-initializing)
+          (place-channel-put worker (Place-Cancel 'obsolete))
+          ;; Release initialization separately; cancellation remains on the FIFO
+          ;; command channel and cannot terminate initialization custody.
+          (place-channel-put control 'release)
+          (check-equal? (receive worker) (Place-Ready))
+          (for ([text '("first" "fail" "later")] [id (in-naturals 1)])
+            (place-channel-put worker (Place-Start id "untitled:test" text (current-directory)))
+            (if (equal? text "fail")
+                (check-match (receive worker) (Place-Terminal (Place-Failure _)))
+                (check-equal? (receive worker)
+                              (Place-Terminal (Place-Resyntax-Result '()))))))
+        (lambda () (place-kill worker) (place-wait worker))))))
+
+(module+ test
+  (test-case "handled optional import failures return empty results and reuse the worker"
+    (define worker (dynamic-place loading-worker 'run-broken))
+    (dynamic-wind
+      void
+      (lambda ()
+        (define-values (control remote) (place-channel))
+        (place-channel-put worker remote)
+        (place-channel-put worker (Place-Prepare 'resyntax))
+        (check-equal? (receive worker) (Place-Ready))
+        (for ([id '(1 2)])
+          (place-channel-put worker
+                             (Place-Start id "untitled:test" "source" (current-directory)))
+          (check-equal? (receive worker) (Place-Terminal (Place-Resyntax-Result '())))))
+      (lambda () (place-kill worker) (place-wait worker)))))

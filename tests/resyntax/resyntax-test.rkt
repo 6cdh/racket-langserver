@@ -5,6 +5,7 @@
            "../../doclib/doc.rkt"
            "../../doclib/internal-types.rkt"
            "../../common/interfaces.rkt"
+           "../../common/path-util.rkt"
            racket/class)
 
   (define has-resyntax? (doc-resyntax-available?))
@@ -300,4 +301,27 @@
       (check-false
         (for/or ([action (in-list actions)])
           (string=? (CodeAction-title action)
-                    (format "Apply rule [~a]" (Resyntax-Result-rule-name res))))))))
+                    (format "Apply rule [~a]" (Resyntax-Result-rule-name res))))))
+
+    (test-case
+      "doc-resyntax: relative require in subdirectory resolves correctly"
+      (define root (make-temporary-file "resyntax-rel-test~a" 'directory))
+      (dynamic-wind
+        void
+        (lambda ()
+          (define sub-dir (build-path root "sub"))
+          (make-directory sub-dir)
+          (display-to-file "#lang racket/base\n(provide val)\n(define val 42)\n"
+                           (build-path sub-dir "helper.rkt"))
+          (define main-path (build-path sub-dir "main.rkt"))
+          (display-to-file "#lang racket/base\n" main-path)
+          (define code "#lang racket/base\n(require \"helper.rkt\")\n(or 1 (or 2 3))\n")
+          (define doc (make-doc (path->uri main-path) code))
+          ;; Parameterize current-directory away from sub-dir to verify that
+          ;; relative resolution uses the document's directory, not ambient current-directory.
+          (parameterize ([current-directory root])
+            (define results (doc-resyntax doc))
+            (check-equal? (length results) 1)
+            (check-equal? (Resyntax-Result-rule-name (first results)) 'nested-or-to-flat-or)))
+        (lambda ()
+          (delete-directory/files root))))))

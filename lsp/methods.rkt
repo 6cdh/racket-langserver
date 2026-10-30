@@ -44,7 +44,7 @@
 ;; Fast queries read the adjusted projection under its lock. Features needing
 ;; current analysis wait on `SafeDoc-analysis-completion` or
 ;; `Analysis-Handle-completion-evt`. The consumer owns acceptance and shares
-;; one analysis per revision, with four execution slots.
+;; one analysis per revision, with two Check Syntax slots and one Resyntax slot.
 
 ;; Mutable variables
 (define already-initialized? #f)

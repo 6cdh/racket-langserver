@@ -17,7 +17,7 @@
 ;; 1. Task deadline: Absolute monotonic timestamp supplied per task by the caller, covering
 ;;    queue wait, place execution, and parent result restoration. Expiry cancels the task
 ;;    while preserving a healthy worker place for subsequent work.
-;; 2. Startup watchdog: Configured timeout (default: 90s) covering native place creation plus
+;; 2. Startup watchdog: Configured timeout (default: 30s) covering native place creation plus
 ;;    first adapter initialization. Expiry retires the uncommunicative worker place.
 ;; 3. Cleanup watchdog: Configured timeout (default: 1s) covering cancellation acknowledgment
 ;;    from the worker place. Expiry retires the unresponsive worker place.
@@ -43,9 +43,9 @@
          Place-Task?
          (contract-out
            [make-place-runner
-            (->* ((or/c 'check-syntax 'resyntax))
-                 (#:slots exact-positive-integer?
-                  #:place-start-guard (-> (-> any) any))
+            (->* ((or/c 'check-syntax 'resyntax)
+                  #:slots exact-positive-integer?)
+                 (#:place-start-guard (-> (-> any) any))
                  Place-Runner?)]
            [submit-place-task!
             (->* (Place-Runner?
@@ -220,17 +220,17 @@
 ;;; Public constructors and entry points
 
 (define (make-place-runner kind
-                           #:slots [slot-count 4]
+                           #:slots slot-count
                            #:place-start-guard [guard (lambda (thunk) (thunk))])
   (make-place-runner/configured kind #:slots slot-count #:place-start-guard guard))
 
 (define (make-place-runner/configured kind
-                                      #:slots [slot-count 4]
+                                      #:slots slot-count
                                       #:place-start-guard [guard (lambda (thunk) (thunk))]
                                       #:factory [factory spawn-worker]
                                       #:restorer [restorer restore-analysis]
                                       #:cleanup-seconds [cleanup-seconds 1]
-                                      #:startup-seconds [startup-seconds 90]
+                                      #:startup-seconds [startup-seconds 30]
                                       #:cleaner [cleaner custodian-shutdown-all])
   (define runner (Place-Runner (make-async-channel) (make-semaphore 1) (make-semaphore 0) #f #f))
   (define pool
@@ -268,9 +268,9 @@
   (provide
     (contract-out
       [make-place-runner/configured
-       (->* ((or/c 'check-syntax 'resyntax))
-            (#:slots exact-positive-integer?
-             #:place-start-guard (-> (-> any) any)
+       (->* ((or/c 'check-syntax 'resyntax)
+             #:slots exact-positive-integer?)
+            (#:place-start-guard (-> (-> any) any)
              #:factory (-> procedure? place?)
              #:restorer (-> Source-Snapshot? boolean? any/c any/c)
              #:cleanup-seconds (and/c real? (>=/c 0))

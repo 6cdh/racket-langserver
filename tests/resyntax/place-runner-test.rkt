@@ -359,7 +359,7 @@
       (sync release-startup)
       worker)
     (parameterize ([current-custodian custodian])
-      (define runner (make-place-runner/configured 'check-syntax #:startup-seconds 8 #:factory factory))
+      (define runner (make-place-runner/configured 'check-syntax #:slots 2 #:startup-seconds 8 #:factory factory))
       (dynamic-wind
         void
         (lambda ()

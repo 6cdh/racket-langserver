@@ -63,15 +63,21 @@
           (define b (request-analysis! scheduler (snapshot "second.rkt")))
           (match-define (cons check-b control-b) (await created))
           (check-equal? (await control-b) (Peer-Preparing 'check-syntax))
+          (define c (request-analysis! scheduler (snapshot "third.rkt")))
+          (sync (system-idle-evt))
+          (check-false (sync/timeout 0 created))
           ;; Both Check Syntax slots are occupied. Resyntax still starts its own place.
           (define input (snapshot "resyntax.rkt"))
           (schedule-resyntax! scheduler input)
           (match-define (cons resyntax control-r) (await created))
           (check-equal? (await control-r) (Peer-Preparing 'resyntax))
+          (schedule-resyntax! scheduler (snapshot "second-resyntax.rkt"))
+          (sync (system-idle-evt))
           (check-false (sync/timeout 0 created))
           (stop-analysis-scheduler! scheduler)
           (check-eq? (Analysis-Outcome-state (await a)) 'stopped)
           (check-eq? (Analysis-Outcome-state (await b)) 'stopped)
+          (check-eq? (Analysis-Outcome-state (await c)) 'stopped)
           (for ([worker (in-list (list check-a check-b resyntax))])
             (await (place-dead-evt worker))))
         (lambda ()
@@ -159,3 +165,44 @@
           (set-resyntax-enabled! previously-enabled?)
           (source-controller-shutdown! controller)
           (custodian-shutdown-all custodian))))))
+
+(module+ test
+  (test-case "controller defaults to two Check Syntax tasks and preserves slot overrides"
+    (for ([override '(#f 3)])
+      (define capacity (or override 2))
+      (define custodian (make-custodian))
+      (define started (make-async-channel))
+      (define gates (for/list ([_ (in-range (add1 capacity))]) (make-semaphore 0)))
+      (define documents
+        (for/list ([id (in-range (add1 capacity))])
+          (new-safedoc (format "untitled:capacity~a.rkt" id) "#lang racket/base\n" 0)))
+      (define (snapshot-id input)
+        (string->number (cadr (regexp-match #rx"capacity([0-9]+)" (Source-Snapshot-uri input)))))
+      (define (analyze input)
+        (define id (snapshot-id input))
+        (async-channel-put started id)
+        (sync (list-ref gates id))
+        (analyze-source input))
+      (parameterize ([current-custodian custodian])
+        (define controller
+          (if override
+              (make-source-controller #:analysis-slots override #:analyze analyze #:resyntax #f)
+              (make-source-controller #:analyze analyze #:resyntax #f)))
+        (dynamic-wind
+          void
+          (lambda ()
+            (for ([document (in-list documents)] [id (in-naturals)])
+              (source-controller-open! controller
+                                       (uri->source (format "untitled:capacity~a.rkt" id))
+                                       document)
+              (when (< id capacity)
+                (check-equal? (await started) id)))
+            ;; With every active task blocked, drain runnable admission work.
+            ;; The extra document must remain queued until a slot is released.
+            (sync (system-idle-evt))
+            (check-false (sync/timeout 0 started))
+            (semaphore-post (car gates))
+            (check-equal? (await started) capacity))
+          (lambda ()
+            (source-controller-shutdown! controller)
+            (custodian-shutdown-all custodian)))))))

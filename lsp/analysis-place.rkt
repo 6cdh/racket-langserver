@@ -83,7 +83,7 @@
 ;; Adapters and loaded modules belong to the worker, never to a transient job.
 ;; Check Syntax creates a fresh namespace, document, trace, and traversal per invocation.
 ;; The documentation caches loaded by doc.rkt serve editor queries, not this execution path.
-;; Resyntax binds its optional API once when its adapter module loads; its source and result
+;; Resyntax binds its optional API once during explicit engine preparation; its source and result
 ;; structures are local to each call.
 ;;
 ;; Third-party module caches and arbitrary readers or macros are not transactional:
@@ -102,6 +102,7 @@
                                   (send (trace result) serialize)))]
 
     ['resyntax
+     ((dynamic-require resyntax-path 'prepare-resyntax!))
      (define analyze (dynamic-require resyntax-path 'run-resyntax))
      (define ->jsexpr (dynamic-require json-path '->jsexpr))
      (lambda (uri text)

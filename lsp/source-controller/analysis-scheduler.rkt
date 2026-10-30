@@ -73,7 +73,7 @@
    [result any/c]))
 
 (define (make-analysis-scheduler events #:analyze [analyze #f] #:resyntax resyntax
-                                 #:timeout [timeout 90] #:slots [slots 4]
+                                 #:timeout [timeout 90] #:slots slots
                                  #:place-start-guard [place-start-guard (lambda (thunk) (thunk))])
   (make-analysis-scheduler/with-runners
     events

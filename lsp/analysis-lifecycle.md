@@ -165,9 +165,10 @@ message is rejected by the reader.
 
 Check Syntax and Resyntax have separate session-owned pools. Each pool has an
 ordinary manager thread that owns its FIFO, absolute deadlines, fixed slots,
-and recovery. `#:analysis-slots` sets Check Syntax capacity, four by default;
-Resyntax has one slot. A controller can have up to five places by default. The
-analysis scheduler (`source-controller/analysis-scheduler.rkt`) routes each kind
+and recovery. `#:analysis-slots` sets Check Syntax capacity, two by default;
+Resyntax has one slot. A controller can have up to three places by default.
+The controller owns the Check Syntax default; scheduler and runner constructors
+require an explicit slot count. The analysis scheduler (`source-controller/analysis-scheduler.rkt`) routes each kind
 to its pool, cancels task handles, and accepts outcomes. It does not know worker
 identities, availability, or retirement counts. A blocked Resyntax task cannot
 reserve Check Syntax capacity, and conversely.
@@ -250,19 +251,35 @@ Library initialization uses a separate persistent lifetime. Readiness is
 reported after the adapter loads. Unhandled initialization errors fail the
 assignment and retire the worker.
 
-The Resyntax adapter binds its optional imports when that module loads,
-including when Doc imports it for Check Syntax. Import failures log and clear
-a cached availability flag; they do not escape to ordinary callers.
-`resyntax-available?` reads that flag, and `run-resyntax` returns no findings
-when disabled. That covers an absent package and errors or missing exports in
-an installed stack. Those handled failures disable Resyntax without retiring
-an otherwise responsive worker. Errors while running an available analyzer
-still follow the ordinary job-failure path.
+Doc imports a lightweight Resyntax facade without instantiating the engine.
+Resyntax worker preparation explicitly instantiates `resyntax-engine.rkt` under
+initialization custody before readiness. Optional import failures log and cache
+unavailability in that engine instance; `run-resyntax` then returns empty findings.
+Handled failures preserve the worker, while runtime analyzer errors remain ordinary
+job failures. A replacement worker initializes its own engine.
+
+Direct `resyntax-available?` and `run-resyntax` calls lazily instantiate the engine
+in the facade module instance's namespace. Availability means usable imports,
+not collection presence. Module instantiation owns the cached bindings. Facade
+loads hold a semaphore so another thread cannot observe incomplete initialization;
+concurrent callers using that facade instance share the initialized engine.
+Direct callers own the initialization lifetime, including any library helpers;
+those helpers are not promised to survive shutdown of that custodian. Logging
+occurs at first engine initialization rather than facade import time.
+
+Controller construction uses a collection lookup to disable the default Resyntax
+pool when the collection is absent. It accepts compiled-only installations and
+preserves explicit analyzer overrides. This construction-time hint assumes worker
+and parent collection configuration match; later package installation is not
+rediscovered. A present but broken installation can consume one worker, retain
+partial imports, and receive repeated no-op submissions. Accepted empty results
+clear that document's findings through normal publication; other documents are
+not globally cleared. No session availability protocol or retry policy is added.
 
 ### Watchdogs
 
 Cancellation acknowledgment waits one second. Native startup and the first
-library initialization share one 90-second watchdog, armed at dispatch and not
+library initialization share one 30-second watchdog, armed at dispatch and not
 renewed when the place is created. These are
 operational defaults, not measured bounds. Repeated cancellation does not
 restart the startup watchdog or the cleanup-acknowledgment timer.
@@ -378,8 +395,9 @@ stops work and clears retention.
 
 ## Capacity
 
-Keep four Check Syntax slots, one Resyntax slot, and lazy startup. Do not add
-prewarming, priority scheduling, or automatic retry. Normal cancellation
+Use two Check Syntax slots by default, one separate Resyntax slot, and lazy
+startup. Explicit Check Syntax slot overrides remain supported. Healthy idle
+workers stay warm. Do not add prewarming, priority scheduling, or automatic retry. Normal cancellation
 preserves the executing place after job cleanup.
 
 The earlier [shared-pool measurements](../bench/shared-place-pool-results.md)
@@ -389,9 +407,17 @@ separate pools. They do not establish a general latency improvement. The
 archived [place-runner measurements](../bench/place-runner-results.md)
 compared one, two, and four slots with an ordinary-thread baseline. Those
 samples showed a warm heavy-batch benefit at four places, and higher first-use
-and resident-memory cost than ordinary threads. They do not justify a
-different default or allocating workers before demand. Controller command
-latency in those reports is not full LSP request latency.
+and resident-memory cost than ordinary threads. The
+[2026-10-28 benchmark](../bench/place-pool-2026-10-28-results.md) recorded similar warm heavy-batch times with two and four places, with lower
+warm RSS growth at two. These single-run samples motivate the provisional
+two-worker default in [backend.md](../backend.md); they do not establish an
+optimal capacity, guaranteed memory savings, or a process memory ceiling.
+The [2026-10-30 comparison](../bench/backend-memory-2026-10-30-results.md)
+retains two slots for the memory goal after repeated isolated loading/capacity
+comparisons, including real stdio edit latency. It records longer waits for later
+heavy jobs and some warm-batch regressions; it does not establish a universally
+optimal capacity. Workers are still allocated only on demand. Controller command
+latency in the earlier reports is not full LSP request latency.
 
 ## Verification
 

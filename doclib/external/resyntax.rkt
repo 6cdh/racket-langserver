@@ -1,47 +1,46 @@
 #lang racket/base
 
-(require "../../common/dynamic-import.rkt"
-         "../../common/interfaces.rkt")
+;; Lightweight facade for optional Resyntax refactoring support.
+;;
+;; Requiring this module does not load the Resyntax engine or its dependencies.
+;; The engine is loaded on demand when explicitly prepared or queried.
 
-(provide run-resyntax
-         resyntax-available?)
+(require racket/runtime-path)
 
-;; Bind the optional API once when this module loads, including when Doc imports
-;; it during Check Syntax. Any failed import logs and disables the adapter;
-;; callers inspect the cached flag instead of handling import exceptions.
-;; Failed bindings are never called after the flag is cleared.
-(define has-resyntax? #t)
+(provide prepare-resyntax!
+         run-resyntax
+         resyntax-available?
+         resyntax-collection-present?)
+
+;; Module instantiation owns initialization and cached availability. Requiring
+;; this facade (including through Doc) does not instantiate the engine.
+(define-runtime-module-path-index engine-path "resyntax-engine.rkt")
+
+;; Preserve module and result-structure identity when callers change namespaces.
+(define-namespace-anchor facade-anchor)
+(define facade-namespace (namespace-anchor->namespace facade-anchor))
+
+;; dynamic-require does not serialize concurrent module initialization.
+;; Protect binding lookup, while leaving analyzer execution outside the lock.
+(define engine-load-lock (make-semaphore 1))
+
+(define (engine-export name)
+  (parameterize ([current-namespace facade-namespace])
+    (call-with-semaphore
+      engine-load-lock
+      (lambda () (dynamic-require engine-path name)))))
+
+(define (prepare-resyntax!)
+  (engine-export #f))
 
 (define (resyntax-available?)
-  has-resyntax?)
+  ((engine-export 'resyntax-available?)))
 
-(define (disable-resyntax!)
-  (set! has-resyntax? #f))
+(define (run-resyntax text [uri #f])
+  ((engine-export 'run-resyntax) text uri))
 
-(dynamic-imports
-  ('resyntax/grimoire/source string-source source->string)
-  ('resyntax/grimoire/string-replacement
-    string-replacement-start string-replacement-original-end string-replacement-new-text)
-  ('resyntax/private/refactoring-result
-    refactoring-result-string-replacement refactoring-result-message
-    refactoring-result-rule-name refactoring-result-set-results)
-  ('resyntax resyntax-analyze)
-  #:fail disable-resyntax!)
-
-(define (run-resyntax text _src)
-  (if has-resyntax?
-      (run-resyntax-impl text)
-      '()))
-
-(define (run-resyntax-impl text)
-  (define text-source (string-source text))
-  (define result-set (resyntax-analyze text-source))
-
-  (for/list ([result (in-list (refactoring-result-set-results result-set))])
-    (define sr (refactoring-result-string-replacement result))
-    (define char-start (string-replacement-start sr))
-    (define char-end (string-replacement-original-end sr))
-    (define message (refactoring-result-message result))
-    (define new-text (string-replacement-new-text sr (source->string text-source)))
-    (define rule-name (refactoring-result-rule-name result))
-    (Resyntax-Result char-start char-end message rule-name new-text)))
+;; Cheap check for collection presence before spawning a dedicated worker place.
+;; Only engine imports inside that place establish true usability.
+;; Collection lookup also supports compiled-only installations.
+(define (resyntax-collection-present?)
+  (and (collection-file-path "main.rkt" "resyntax" #:fail (lambda (_) #f)) #t))
