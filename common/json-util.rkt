@@ -157,6 +157,11 @@
 ;; Duplicate or unknown keywords are rejected at compile time.
 ;; A `#:rest` field holds a hash of otherwise-unclaimed JSON properties. It is
 ;; flattened back into the surrounding object when the struct is encoded.
+;; Keyword calls expand to positional construction after evaluating arguments
+;; once in caller order. Decoders construct in field declaration order.
+;; Guards check predicate-only field types directly, falling back to the contract
+;; guard for errors. Arbitrary `(contract C)` and hash fields retain contract
+;; projections, including protection of later operations on mutable values.
 ;;
 ;; Enum:
 ;;   (Name 'variant)          constructor
@@ -212,6 +217,12 @@
 ;;   tests/json-enum-union-test.rkt
 ;;
 (begin-for-syntax
+  ;; Carry struct identity on the existing public constructor/match binding.
+  ;; Unknown and forward references conservatively keep contract projections.
+  (struct json-struct-transformer (match expression predicate)
+    #:property prop:match-expander (struct-field-index match)
+    #:property prop:procedure (struct-field-index expression))
+
   (define (symbol->keyword sym)
     (string->keyword (symbol->string sym)))
 
@@ -230,28 +241,39 @@
   (define name->decode-match-id (name-id "^~a"))
   (define name->try-decoder-id (name-id "try-jsexpr->~a"))
   (define json-struct-internal-id (name-id "~a~~"))
-  (define json-struct-keyword-constructor-id (name-id "~a~~kw"))
   (define json-struct-predicate-internal-id (name-id "~a~~?"))
 
   (define json-struct-accessor-id (name+field-id "~a~~-~a"))
   (define json-public-accessor-id (name+field-id "~a-~a"))
 
-  (define builtin-contract-ids
-    '(string?
-       boolean?
-       number?
-       exact-integer?
-       exact-nonnegative-integer?
-       symbol?))
+  (define builtin-predicate-ids
+    (syntax->list #'(string? boolean? number? exact-integer?
+                             exact-nonnegative-integer? symbol?)))
+
+  (define builtin-predicate-symbols
+    (for/seteq ([id (in-list builtin-predicate-ids)])
+      (syntax-e id)))
 
   (define (builtin-contract-id? id)
     (and (identifier? id)
-         (memq (syntax-e id) builtin-contract-ids)))
+         (set-member? builtin-predicate-symbols (syntax-e id))))
+
+  (define (builtin-predicate-binding? id)
+    (for/or ([builtin (in-list builtin-predicate-ids)])
+      (free-identifier=? id builtin)))
+
+  (define (struct-type-binding? id)
+    (define binding (syntax-local-value id (lambda () #f)))
+    ;; An imported constructor alone does not establish that the caller's Name?
+    ;; still resolves to this struct's predicate instead of a shadowing binding.
+    (and (json-struct-transformer? binding)
+         (free-identifier=? (name->pred-id id)
+                            (json-struct-transformer-predicate binding))))
 
   (define (quote-datum stx)
     #`'#,(syntax->datum stx))
 
-  (define (json-type-ctc id)
+  (define (json-type-runtime-pred id)
     #`(lambda (x)
         (#,(name->pred-id id) x)))
 
@@ -259,48 +281,61 @@
     #`(lambda (x)
         (#,(name->decoder-id id) x)))
 
-  (define (json-type-predicate id)
+  (define (json-type-json-pred id)
     #`(lambda (x)
         (#,(name->js-pred-id id) x)))
 
-  ;; type-spec normalizes the DSL type annotation into five compile-time
+  ;; type-spec normalizes the DSL type annotation into compile-time
   ;; attributes used by define-json-struct expansion:
   ;; - ctc: contract for the generated struct field
+  ;; - predicate: runtime membership check, separate from contract application
+  ;; - guard-safe?: predicate success fully enforces ctc without wrapping values
   ;; - decoder: function to decode JSON values into Racket values
   ;; - json-pred: predicate used by the generated `*-js?` validator
   ;; - label: quoted type-spec datum used in decoder error messages
   ;; - optional?: whether the field can be omitted (for optional ...)
   (define-syntax-class type-spec
-    #:attributes (ctc decoder json-pred label optional?)
+    #:attributes (ctc predicate guard-safe? decoder json-pred label optional?)
     #:datum-literals (contract listof optional hashof union)
     ;; Builtin primitive contracts are shorthands for `(contract ...)`. Keep the
     ;; allowlist small so project-local predicates remain explicit.
     (pattern tid:id
              #:when (builtin-contract-id? #'tid)
              #:with ctc #'tid
+             #:with predicate (if (builtin-predicate-binding? #'tid)
+                                  #'tid
+                                  #'(lambda (x) (contract-first-order-passes? tid x)))
+             #:attr guard-safe? (builtin-predicate-binding? #'tid)
              #:with decoder #'values
-             #:with json-pred #'tid
+             #:with json-pred #'predicate
              #:with label (quote-datum #'tid)
              #:attr optional? #f)
     ;; Bare non-builtin identifiers are JSON domain types. References are lazy
     ;; so a type can name itself in its own field specs.
     (pattern tid:id
-             #:with ctc (json-type-ctc #'tid)
+             #:with ctc (json-type-runtime-pred #'tid)
+             #:with predicate (json-type-runtime-pred #'tid)
+             #:attr guard-safe? (struct-type-binding? #'tid)
              #:with decoder (json-type-decoder #'tid)
-             #:with json-pred (json-type-predicate #'tid)
+             #:with json-pred (json-type-json-pred #'tid)
              #:with label (quote-datum #'tid)
              #:attr optional? #f)
     ;; Explicit escape hatch for Racket predicates/contracts. It does not perform
     ;; JSON type decoding; the value is checked and passed through.
     (pattern (contract ctc-expr:expr)
              #:with ctc #'ctc-expr
+             #:with predicate #'(lambda (x) (contract-first-order-passes? ctc-expr x))
+             #:attr guard-safe? #f
              #:with decoder #'values
-             #:with json-pred #'ctc-expr
+             #:with json-pred #'predicate
              #:with label (quote-datum #'(contract ctc-expr))
              #:attr optional? #f)
     ;; Homogeneous lists recursively decode/validate each element.
     (pattern (listof elem:type-spec)
              #:with ctc #'(listof elem.ctc)
+             #:with predicate #'(lambda (xs)
+                                  (and (list? xs) (andmap elem.predicate xs)))
+             #:attr guard-safe? (attribute elem.guard-safe?)
              #:with decoder #'(lambda (xs) (map elem.decoder xs))
              #:with json-pred #'(lambda (xs)
                                   (and (list? xs)
@@ -310,24 +345,37 @@
     ;; Optional values propagate Nothing unchanged and decode present values.
     (pattern (optional elem:type-spec)
              #:with ctc #'(optional/c elem.ctc)
+             #:with predicate #'(lambda (x) (or (Nothing? x) (elem.predicate x)))
+             #:attr guard-safe? (attribute elem.guard-safe?)
              #:with decoder #'(lambda (x)
                                 (if (Nothing? x)
                                     x
                                     (elem.decoder x)))
-             #:with json-pred #'(optional/c elem.json-pred)
+             #:with json-pred #'(lambda (x) (or (Nothing? x) (elem.json-pred x)))
              #:with label (quote-datum #'(optional elem))
              #:attr optional? #t)
     (pattern (hashof key:type-spec val:type-spec)
              #:with ctc #'(hash/c key.ctc val.ctc)
+             #:with predicate #'(lambda (h)
+                                  (and (hash? h)
+                                       (for/and ([(k v) (in-hash h)])
+                                         (and (key.predicate k) (val.predicate v)))))
+             ;; hash/c can protect later reads/writes even with flat entries.
+             #:attr guard-safe? #f
              #:with decoder #'(lambda (h)
                                 (for/hasheq ([(k v) (in-hash h)])
                                   (values (key.decoder k) (val.decoder v))))
-             #:with json-pred #'(hash/c key.json-pred val.json-pred)
+             #:with json-pred #'(lambda (h)
+                                  (and (hash? h)
+                                       (for/and ([(k v) (in-hash h)])
+                                         (and (key.json-pred k) (val.json-pred v)))))
              #:with label (quote-datum #'(hashof key val))
              #:attr optional? #f)
     (pattern (union opt:type-spec ...+)
              #:with ctc #'(or/c opt.ctc ...)
-             #:with json-pred #'(or/c opt.json-pred ...)
+             #:with predicate #'(lambda (x) (or (opt.predicate x) ...))
+             #:attr guard-safe? (andmap values (attribute opt.guard-safe?))
+             #:with json-pred #'(lambda (x) (or (opt.json-pred x) ...))
              #:with label (quote-datum #'(union opt ...))
              #:with decoder #'(lambda (x)
                                 (let/ec return
@@ -345,18 +393,23 @@
   ;;   - [field type-spec]            -> json key is same as field name
   ;;   - [field type-spec #:json key] -> custom json key
   (define-syntax-class json-struct-clause
-    #:attributes (field type-pred type-decoder type-json-pred type-label optional? json-key keyword)
+    #:attributes (field type-contract type-predicate guard-safe? type-decoder type-json-pred
+                        type-label optional? json-key keyword)
     (pattern [field:id ts:type-spec]
              #:with json-key #'field
              #:with keyword (symbol->keyword (syntax-e #'field))
-             #:with type-pred #'ts.ctc
+             #:with type-contract #'ts.ctc
+             #:with type-predicate #'ts.predicate
+             #:attr guard-safe? (attribute ts.guard-safe?)
              #:with type-decoder #'ts.decoder
              #:with type-json-pred #'ts.json-pred
              #:with type-label #'ts.label
              #:attr optional? (attribute ts.optional?))
     (pattern [field:id ts:type-spec #:json json-key:id]
              #:with keyword (symbol->keyword (syntax-e #'field))
-             #:with type-pred #'ts.ctc
+             #:with type-contract #'ts.ctc
+             #:with type-predicate #'ts.predicate
+             #:attr guard-safe? (attribute ts.guard-safe?)
              #:with type-decoder #'ts.decoder
              #:with type-json-pred #'ts.json-pred
              #:with type-label #'ts.label
@@ -366,9 +419,9 @@
     (for/or ([x (in-list (syntax->list stx))])
       (keyword? (syntax-e x))))
 
-  (define (ensure-no-duplicate-keywords who k-list)
+  (define (ensure-no-duplicate-keywords who kw-stxs)
     (define seen (mutable-seteq))
-    (for ([k k-list])
+    (for ([k (in-list kw-stxs)])
       (define key (syntax-e k))
       (when (set-member? seen key)
         (raise-syntax-error who
@@ -377,7 +430,8 @@
       (set-add! seen key)))
 
   ;; Generates the internal struct definition with JSON serialization method and contracts.
-  (define (gen-contracted-struct stx iname fields contracts json-keys accessors rest-accessor)
+  (define (gen-contracted-struct stx internal-id fields contracts predicates guard-safe?
+                                 json-keys accessors rest-accessor)
     (define serializer
       (with-syntax ([(jk ...) json-keys]
                     [(acc ...) accessors]
@@ -389,30 +443,44 @@
                      [value (in-list (list (acc self) ...))]
                      #:unless (Nothing? value))
             (hash-set result key (->jsexpr value)))))
-    (with-syntax ([iname iname]
+    (define guard-expr
+      (if guard-safe?
+          (with-syntax ([(fld ...) fields]
+                        [(ctc ...) contracts]
+                        [(predicate ...) predicates]
+                        [(pred ...) (generate-temporaries fields)])
+            #'(let ([pred predicate] ...
+                    [original-guard (struct-guard/c ctc ...)])
+                (lambda (fld ... struct-name)
+                  (if (and (pred fld) ...)
+                      (values fld ...)
+                      (original-guard fld ... struct-name)))))
+          #`(struct-guard/c #,@contracts)))
+
+    (with-syntax ([internal-id internal-id]
                   [(fld ...) fields]
-                  [(ctc ...) contracts]
+                  [guard-expr guard-expr]
                   [serializer serializer])
-      #'(struct iname (fld ...)
+      #'(struct internal-id (fld ...)
           #:transparent
-          #:guard (struct-guard/c ctc ...)
+          #:guard guard-expr
           #:methods gen:jsexpr-struct
           [(define (struct->jsexpr self)
              serializer)])))
 
-  ;; Public aliases for the accessors.
   (define (gen-public-accessors public-accessors accessors)
-    (for/list ([pub public-accessors]
-               [acc accessors])
+    (for/list ([pub (in-list public-accessors)]
+               [acc (in-list accessors)])
       #`(define #,pub #,acc)))
 
   ;; Generates Name-js? predicate.
-  ;; Checks JSON hash shape and validates each field contract.
+  ;; Checks JSON hash shape and field membership. Arbitrary contracts use their
+  ;; first-order checks here; the constructor applies their full projections.
   (define (gen-json-predicate stx js-pred-name json-keys json-preds optional-flags)
     (define checks
-      (for/list ([jk json-keys]
-                 [jp json-preds]
-                 [opt? optional-flags])
+      (for/list ([jk (in-list json-keys)]
+                 [jp (in-list json-preds)]
+                 [opt? (in-list optional-flags)])
         (if opt?
             #`(or (not (hash-has-key? x '#,jk))
                   (#,jp (hash-ref x '#,jk)))
@@ -426,50 +494,55 @@
                ...))))
 
   ;; Generates jsexpr->Name decoder.
-  (define (gen-json-decoder stx decoder-name name keyword-constructor-id json-keys keywords
-                            fields decoders labels rest-keyword)
+  (define (gen-json-decoder stx decoder-name name internal-id json-keys
+                            fields decoders labels rest-field)
     (define input-id (datum->syntax stx 'js))
     (define decoder-symbol-expr (quote-datum decoder-name))
-    (define rest-value
-      (and rest-keyword
+    (define field-bindings
+      (for/list ([json-key (in-list json-keys)]
+                 [field (in-list fields)]
+                 [decoder (in-list decoders)]
+                 [label (in-list labels)])
+        (define fv-expr
+          (if (and (identifier? decoder) (free-identifier=? decoder #'values))
+              #`(hash-ref #,input-id '#,json-key (Nothing))
+              #`(let ([v (hash-ref #,input-id '#,json-key (Nothing))])
+                  (if (Nothing? v)
+                      v
+                      (with-handlers ([exn:fail?
+                                       (lambda (e)
+                                         (raise-arguments-error
+                                           #,decoder-symbol-expr
+                                           "failed to decode field"
+                                           "type" '#,name
+                                           "field" '#,field
+                                           "expected" #,label
+                                           "value" v
+                                           "cause" (exn-message e)))])
+                        (#,decoder v))))))
+        (list field fv-expr)))
+    (define rest-binding
+      (and rest-field
            (with-syntax ([input input-id]
                          [(jk ...) json-keys])
-             #'(for/hasheq ([(key value) (in-hash input)]
-                            #:unless (memq key '(jk ...)))
-                 (values key value)))))
-    (define field-values
-      (for/list ([jk json-keys]
-                 [fld fields]
-                 [dec decoders]
-                 [label labels])
-        #`(let ([v (hash-ref #,input-id '#,jk (Nothing))])
-            (if (Nothing? v)
-                v
-                (with-handlers ([exn:fail?
-                                 (lambda (e)
-                                   (raise-arguments-error
-                                     #,decoder-symbol-expr
-                                     "failed to decode field"
-                                     "type" '#,name
-                                     "field" '#,fld
-                                     "expected" #,label
-                                     "value" v
-                                     "cause" (exn-message e)))])
-                  (#,dec v))))))
+             (list rest-field
+                   #'(for/hasheq ([(key value) (in-hash input)]
+                                  #:unless (memq key '(jk ...)))
+                       (values key value))))))
+    (define all-bindings
+      (if rest-binding
+          (append field-bindings (list rest-binding))
+          field-bindings))
     (with-syntax ([decoder-name decoder-name]
                   [decoder-symbol (quote-datum decoder-name)]
                   [input input-id]
-                  [keyword-constructor keyword-constructor-id]
-                  [(kw ...) keywords]
-                  [(fv ...) field-values]
-                  [(rest-arg ...)
-                   (if rest-keyword
-                       (list rest-keyword rest-value)
-                       '())])
+                  [internal-id internal-id]
+                  [([var-id val-expr] ...) all-bindings])
       #'(define (decoder-name input)
           (unless (hash? input)
             (error decoder-symbol "expected hash, got ~v" input))
-          (keyword-constructor (~@ kw fv) ... rest-arg ...))))
+          (let* ([var-id val-expr] ...)
+            (internal-id var-id ...)))))
 
   ;; Generates as-Name / ^Name match expanders and helper decoder wrapper.
   (define (gen-as-match-expanders stx as-name decode-name try-decoder decoder-name name)
@@ -485,9 +558,9 @@
           (define-match-expander as-name
             (lambda (inner-stx)
               (syntax-parse inner-stx
-                [(_ name)
+                [(_ p)
                  #'(and (? hash?)
-                        (app try-decoder (and name (not (? Nothing?)))))])))
+                        (app try-decoder (and (not (? Nothing?)) p)))])))
           (define-match-expander decode-name
             (lambda (inner-stx)
               (syntax-parse inner-stx
@@ -512,38 +585,54 @@
                 #'(combine-out name pred pub ... name-js name-js-pred decoder as-name decode-name)
                 modes))))))
 
-  ;; Generates keyword-argument constructor with contract enforcement.
-  (define (gen-kw-constructor keyword-constructor-id iname fields keywords contracts struct-pred)
-    (with-syntax ([keyword-constructor keyword-constructor-id]
-                  [iname iname]
-                  [struct-pred struct-pred]
-                  [(kw ...) keywords]
-                  [(fld ...) fields]
-                  [(ctc ...) contracts])
-      #'(define/contract (keyword-constructor (~@ kw fld) ...)
-          (-> (~@ kw ctc) ... struct-pred)
-          (iname fld ...))))
+  ;; Bind in source order, then reorder values for the positional constructor.
+  (define (gen-constructor-kw-call stx internal-id keywords kw-stxs val-stxs)
+    (ensure-no-duplicate-keywords 'define-json-struct kw-stxs)
+    (define valid-keywords
+      (for/seteq ([kw (in-list keywords)])
+        (syntax-e kw)))
+    (define temps (generate-temporaries val-stxs))
+    (define supplied
+      (for/hasheq ([key (in-list kw-stxs)]
+                   [temp (in-list temps)])
+        (unless (set-member? valid-keywords (syntax-e key))
+          (raise-syntax-error 'define-json-struct "unknown keyword argument" stx key))
+        (values (syntax-e key) temp)))
+    (define ordered
+      (for/list ([key (in-list keywords)])
+        (hash-ref supplied
+                  (syntax-e key)
+                  (lambda ()
+                    (raise-syntax-error 'define-json-struct
+                                        (format "missing keyword argument ~a" (syntax-e key))
+                                        stx)))))
+    (with-syntax ([internal-id internal-id]
+                  [(temp ...) temps]
+                  [(value ...) val-stxs]
+                  [(argument ...) ordered])
+      (quasisyntax/loc stx
+        (let* ([temp value] ...)
+          (internal-id argument ...)))))
 
-  ;; Generates the match pattern for keyword-based matching.
-  (define (gen-match-kw-pattern stx k-list v-list keywords fields json-keys iname mode)
-    (ensure-no-duplicate-keywords 'define-json-struct k-list)
+  (define (gen-match-kw-pattern stx kw-stxs val-stxs keywords fields json-keys internal-id mode)
+    (ensure-no-duplicate-keywords 'define-json-struct kw-stxs)
 
     (define keyword->idx
-      (for/hasheq ([kw keywords]
+      (for/hasheq ([kw (in-list keywords)]
                    [i (in-naturals)])
         (values (syntax-e kw) i)))
 
-    (define (unknown-keyword-failure k)
-      (lambda ()
-        (raise-syntax-error 'define-json-struct
-                            (format "unknown keyword ~a" (syntax-e k))
-                            k)))
-
     (define-values (s-pats h-pats)
       (for/lists (s h)
-                 ([k k-list]
-                  [v v-list])
-        (define idx (hash-ref keyword->idx (syntax-e k) (unknown-keyword-failure k)))
+                 ([k (in-list kw-stxs)]
+                  [v (in-list val-stxs)])
+        (define idx
+          (hash-ref keyword->idx
+                    (syntax-e k)
+                    (lambda ()
+                      (raise-syntax-error 'define-json-struct
+                                          (format "unknown keyword ~a" (syntax-e k))
+                                          k))))
         (define fld (list-ref fields idx))
         (define jk (list-ref json-keys idx))
         (with-syntax ([fld fld]
@@ -552,65 +641,68 @@
           (values #'[fld v] #'['jk v]))))
 
     (if (eq? mode 'struct)
-        #`(struct* #,iname (#,@s-pats))
+        #`(struct* #,internal-id (#,@s-pats))
         #`(hash-table #,@h-pats)))
 
-  ;; Generates the match pattern for positional matching.
-  (define (gen-match-pos-pattern stx v-list fields json-keys iname mode)
-    (unless (= (length v-list) (length fields))
+  (define (gen-match-pos-pattern stx val-stxs fields json-keys internal-id mode)
+    (unless (= (length val-stxs) (length fields))
       (raise-syntax-error
         'define-json-struct
         (format "wrong number of arguments for positional pattern (expected ~a, given ~a)"
-                (length fields) (length v-list))
+                (length fields) (length val-stxs))
         stx))
 
-    (with-syntax ([iname iname]
-                  [(v ...) v-list]
+    (with-syntax ([internal-id internal-id]
+                  [(v ...) val-stxs]
                   [(jk ...) json-keys])
       (cond [(eq? mode 'struct)
-             #'(iname v ...)]
+             #'(internal-id v ...)]
             [else
              #'(hash-table ['jk v] ...)])))
 
-  ;; Generates the public Name match/constructor wrapper.
-  (define (gen-struct-match-expander stx name iname keyword-constructor-id keywords fields json-keys)
-    (with-syntax ([iname iname]
-                  [keyword-constructor keyword-constructor-id]
+  (define (gen-struct-match-expander stx name internal-id keywords fields json-keys)
+    (with-syntax ([internal-id internal-id]
                   [name name]
+                  [pred (name->pred-id name)]
                   [(kw ...) keywords]
                   [(fld ...) fields]
                   [(jk ...) json-keys])
-      #`(define-match-expander name
-          (λ (inner-stx)
-            (syntax-parse inner-stx
-              [(_ (~seq k:keyword v) (... ...+))
-               (gen-match-kw-pattern inner-stx (syntax->list #'(k (... ...))) (syntax->list #'(v (... ...)))
-                                     (list #'kw ...) (list #'fld ...) (list #'jk ...)
-                                     #'iname 'struct)]
-              [(_ v (... ...))
-               (gen-match-pos-pattern inner-stx (syntax->list #'(v (... ...)))
-                                      (list #'fld ...) (list #'jk ...)
-                                      #'iname 'struct)]))
-          (λ (inner-stx)
-            (syntax-parse inner-stx
-              [(_ (~seq k:keyword v) (... ...+))
-               (begin
-                 (define k-list (syntax->list #'(k (... ...))))
-                 (define v-list (syntax->list #'(v (... ...))))
-                 (ensure-no-duplicate-keywords 'define-json-struct k-list)
-                 (define kv-args
-                   (append*
-                     (for/list ([kw-arg k-list] [val-arg v-list])
-                       (list kw-arg val-arg))))
-                 (with-syntax ([(arg (... ...)) kv-args])
-                   (syntax/loc inner-stx
-                     (keyword-constructor arg (... ...)))))]
-              [(_ a (... ...))
-               #:fail-when (any-keyword? #'(a (... ...)))
-               "mixed positional and keyword arguments are not allowed"
-               (syntax/loc inner-stx (iname a (... ...)))])))))
+      #`(define-syntax name
+          (json-struct-transformer
+            (λ (inner-stx)
+              (syntax-parse inner-stx
+                [(_ (~seq k:keyword v) (... ...+))
+                 (gen-match-kw-pattern inner-stx
+                                       (syntax->list #'(k (... ...)))
+                                       (syntax->list #'(v (... ...)))
+                                       (list #'kw ...)
+                                       (list #'fld ...)
+                                       (list #'jk ...)
+                                       #'internal-id
+                                       'struct)]
+                [(_ v (... ...))
+                 (gen-match-pos-pattern inner-stx
+                                        (syntax->list #'(v (... ...)))
+                                        (list #'fld ...)
+                                        (list #'jk ...)
+                                        #'internal-id
+                                        'struct)]))
+            (λ (inner-stx)
+              (syntax-parse inner-stx
+                [(_ (~seq k:keyword v) (... ...+))
+                 (gen-constructor-kw-call inner-stx
+                                          #'internal-id
+                                          (list #'kw ...)
+                                          (syntax->list #'(k (... ...)))
+                                          (syntax->list #'(v (... ...))))]
+                [(_ a (... ...))
+                 #:fail-when (any-keyword? #'(a (... ...)))
+                 "mixed positional and keyword arguments are not allowed"
+                 (syntax/loc inner-stx (internal-id a (... ...)))]
+                [id:id
+                 (syntax/loc inner-stx internal-id)]))
+            #'pred))))
 
-  ;; Generates the Name-js match expander.
   (define (gen-json-match-expander stx name-js keywords fields json-keys)
     (with-syntax ([name-js name-js]
                   [(kw ...) keywords]
@@ -620,13 +712,21 @@
           (λ (inner-stx)
             (syntax-parse inner-stx
               [(_ (~seq k:keyword v) (... ...+))
-               (gen-match-kw-pattern inner-stx (syntax->list #'(k (... ...))) (syntax->list #'(v (... ...)))
-                                     (list #'kw ...) (list #'fld ...) (list #'jk ...)
-                                     #f 'json)]
+               (gen-match-kw-pattern inner-stx
+                                     (syntax->list #'(k (... ...)))
+                                     (syntax->list #'(v (... ...)))
+                                     (list #'kw ...)
+                                     (list #'fld ...)
+                                     (list #'jk ...)
+                                     #f
+                                     'json)]
               [(_ v (... ...))
-               (gen-match-pos-pattern inner-stx (syntax->list #'(v (... ...)))
-                                      (list #'fld ...) (list #'jk ...)
-                                      #f 'json)]))))))
+               (gen-match-pos-pattern inner-stx
+                                      (syntax->list #'(v (... ...)))
+                                      (list #'fld ...)
+                                      (list #'jk ...)
+                                      #f
+                                      'json)]))))))
 
 
 ;; define-json-struct
@@ -636,7 +736,9 @@
         (~optional (~seq #:rest rest-field:id) #:defaults ([rest-field #f])))
      ;; Extract normalized per-field metadata from `json-struct-clause`.
      (define fields (syntax->list #'(clause.field ...)))
-     (define contracts (syntax->list #'(clause.type-pred ...)))
+     (define contracts (syntax->list #'(clause.type-contract ...)))
+     (define predicates (syntax->list #'(clause.type-predicate ...)))
+     (define guard-safe? (andmap values (attribute clause.guard-safe?)))
      (define decoders (syntax->list #'(clause.type-decoder ...)))
      (define labels (syntax->list #'(clause.type-label ...)))
      (define json-preds (syntax->list #'(clause.type-json-pred ...)))
@@ -656,14 +758,15 @@
        (if rest-field-stx
            (append contracts (list #'hash?))
            contracts))
+     (define all-predicates
+       (if rest-field-stx (append predicates (list #'hash?)) predicates))
      (define rest-keyword
        (and rest-field-stx (symbol->keyword (syntax-e rest-field-stx))))
      (define all-keywords
        (if rest-field-stx (append keywords (list rest-keyword)) keywords))
 
      ;; Generate identifiers once and reuse to avoid drift between definitions.
-     (define iname (json-struct-internal-id #'name))
-     (define keyword-constructor-id (json-struct-keyword-constructor-id #'name))
+     (define internal-id (json-struct-internal-id #'name))
      (define accessors
        (for/list ([f all-fields])
          (json-struct-accessor-id #'name f)))
@@ -686,22 +789,20 @@
      (datum->syntax
        stx
        `(begin
-          ,(gen-contracted-struct stx iname all-fields all-contracts json-keys
-                                  regular-accessors rest-accessor)
-          ,(gen-kw-constructor keyword-constructor-id iname all-fields all-keywords
-                               all-contracts struct-pred-internal)
+          ,(gen-contracted-struct stx internal-id all-fields all-contracts all-predicates guard-safe?
+                                  json-keys regular-accessors rest-accessor)
           ,@(gen-public-accessors public-accessors accessors)
           (define ,pred ,struct-pred-internal)
 
-          ,(gen-struct-match-expander stx #'name iname keyword-constructor-id all-keywords
+          ,(gen-struct-match-expander stx #'name internal-id all-keywords
                                       all-fields
                                       (if rest-field-stx
                                           (append json-keys (list rest-field-stx))
                                           json-keys))
           ,(gen-json-match-expander stx name-js keywords fields json-keys)
           ,(gen-json-predicate stx name-js-pred json-keys json-preds optional-flags)
-          ,(gen-json-decoder stx decoder-name #'name keyword-constructor-id json-keys keywords
-                             fields decoders labels rest-keyword)
+          ,(gen-json-decoder stx decoder-name #'name internal-id json-keys
+                             fields decoders labels rest-field-stx)
           ,(gen-as-match-expanders stx as-name decode-name try-decoder decoder-name #'name)
 
           ,(gen-exports name-exports #'name pred public-accessors name-js name-js-pred decoder-name as-name decode-name))
@@ -783,7 +884,7 @@
              (lambda (inner-stx)
                (syntax-parse inner-stx
                  [(_ p)
-                  #'(app try-decoder (and p (not (? Nothing?))))])))
+                  #'(app try-decoder (and (not (? Nothing?)) p))])))
            (define-match-expander decode-name
              (lambda (inner-stx)
                (syntax-parse inner-stx
@@ -822,16 +923,13 @@
                       [as-name as-name]
                       [decode-name decode-name]
                       [try-decoder try-decoder]
-                      [runtime-pred #'ts.ctc]
+                      [runtime-pred #'ts.predicate]
                       [decoder #'ts.decoder]
                       [json-pred #'ts.json-pred])
           #'(begin
-              (define (pred x)
-                (runtime-pred x))
-              (define (js-pred x)
-                (json-pred x))
-              (define (js->name x)
-                (decoder x))
+              (define pred runtime-pred)
+              (define js-pred json-pred)
+              (define js->name decoder)
               (define-match-expander js-match
                 (λ (inner-stx)
                   (syntax-parse inner-stx
@@ -844,7 +942,7 @@
                 (lambda (inner-stx)
                   (syntax-parse inner-stx
                     [(_ p)
-                     #'(app try-decoder (and p (not (? Nothing?))))])))
+                     #'(app try-decoder (and (not (? Nothing?)) p))])))
               (define-match-expander decode-name
                 (lambda (inner-stx)
                   (syntax-parse inner-stx
