@@ -2886,3 +2886,15 @@ END
     (check-true (doc-expand! doc))
     (check-eq? (Doc-source doc) source)
     (check-equal? (Doc-Contribution-path (Doc-contribution doc)) normalized)))
+
+(module+ test
+  (test-case "cursor code actions preserve strict interval overlap"
+    (define doc (make-doc "file:///tmp/cursor-actions.rkt"
+                          "#lang racket/base\n(define unused 0)\n"))
+    (doc-expand! doc)
+    (define (titles column)
+      (define pos (Pos 1 column))
+      (map CodeAction-title (doc-code-action doc (Range pos pos))))
+    (check-not-false (member "Add prefix `_` to ignore" (titles 10)))
+    (check-false (member "Add prefix `_` to ignore" (titles 8)))
+    (check-equal? (titles 0) '())))

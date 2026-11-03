@@ -12,7 +12,6 @@
 ;; and comment scanning run when the trace is built, not on each hover request.
 
 (require "../interface.rkt"
-         "../interval-map-snapshot.rkt"
          "../../internal-types.rkt"
          "types.rkt"
          "detail.rkt"
@@ -20,7 +19,7 @@
          racket/class
          racket/match
          racket/set
-         data/interval-map
+         "../../../common/interval-map.rkt"
          drracket/check-syntax
          (only-in "../../lexer.rkt"
                   LexerState-language-policy
@@ -107,7 +106,7 @@
                  (Stored-Hover-Annotation (Hover-Annotation kind text) span)])))
       (set! detail-by-range (snapshot->interval-map details datum->detail)))
 
-    ;; Do not expose interval-maps. Bounds are the atomic range over which this
+    ;; Do not expose interval ropes. Bounds are the atomic range over which this
     ;; exact winner remains active.
     (define/public (annotation-at pos)
       (define-values (start end stored-annotation)
@@ -117,7 +116,7 @@
               (and stored-annotation
                    (Stored-Hover-Annotation-annotation stored-annotation))))
 
-    ;; Do not expose interval-maps. Returns start, end, Hover-Detail, or #f #f #f.
+    ;; Do not expose interval ropes. Returns start, end, Hover-Detail, or #f #f #f.
     ;; Replay may return #f when a deletion broke the detail. Treat that as a miss.
     (define/public (source-detail-at pos)
       (define-values (start end stored-detail)

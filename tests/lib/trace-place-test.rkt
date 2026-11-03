@@ -2,7 +2,6 @@
 
 (require rackunit
          racket/class
-         racket/dict
          racket/file
          racket/list
          racket/match
@@ -11,6 +10,7 @@
          racket/runtime-path
          racket/set
          racket/string
+         "../../common/interval-map.rkt"
          "../../common/interfaces.rkt"
          "../../common/json-util.rkt"
          "../../common/source.rkt"
@@ -87,10 +87,10 @@
   (define types (send trace get-typed-racket))
   (list
     (sort (send trace get-completions) symbol<?)
-    (dict->list (send trace get-docs))
-    (dict->list (send trace get-requires))
-    (for/list ([(range action) (in-dict (send trace get-quickfixs))])
-      (cons range (->jsexpr action)))
+    (interval-map->list (send trace get-docs))
+    (interval-map->list (send trace get-requires))
+    (for/list ([(start end action) (in-interval-map (send trace get-quickfixs))])
+      (cons (cons start end) (->jsexpr action)))
     (send trace get-semantic-tokens)
     (send (send trace get-inlay-hints) hints-in-range 0 length)
     (frequencies (send decl module-binding-definitions))
@@ -169,7 +169,7 @@
         [(racket)
          (check-true (Analysis-Product-succeeded? restored))
          (check-not-false (memq 'f (send (Analysis-Product-trace restored) get-completions)))
-         (check-true (pair? (dict->list (send (Analysis-Product-trace restored) get-quickfixs))))]
+         (check-true (pair? (interval-map->list (send (Analysis-Product-trace restored) get-quickfixs))))]
         [(typed-racket)
          (check-true (pair? (send (send (Analysis-Product-trace restored) get-inlay-hints)
                                   hints-in-range 0 (string-length text))))]
@@ -246,8 +246,8 @@
         (check-equal? (Module-Binding-filepath (send declarations module-binding-at use))
                       (source-file-path (Source-Snapshot-source submitted)))
         (check-not-false (member (build-path root "dep.rkt")
-                                 (dict-values (send trace get-requires))))
-        (check-true (for/or ([(range action) (in-dict (send trace get-quickfixs))])
+                                 (map cdr (interval-map->list (send trace get-requires)))))
+        (check-true (for/or ([(start end action) (in-interval-map (send trace get-quickfixs))])
                       (hash-has-key? (WorkspaceEdit-changes (CodeAction-edit action))
                                      (string->symbol uri))))
         (define direct
@@ -291,6 +291,6 @@
       (define doc (make-source-doc (Source-Snapshot-source submitted) text))
       (doc-update-trace! doc (Analysis-Product-trace product) #f 0)
       (doc-signature-help doc (Pos 1 5)))
-    (check-true (pair? (dict->list (send (Analysis-Product-trace restored) get-docs))))
+    (check-true (pair? (interval-map->list (send (Analysis-Product-trace restored) get-docs))))
     (check-not-false (signature restored))
     (check-equal? (signature restored) (signature direct))))

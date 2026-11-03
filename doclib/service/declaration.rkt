@@ -25,18 +25,15 @@
 ;; document.
 
 (require "interface.rkt"
-         "interval-map-snapshot.rkt"
          "char-range-edit.rkt"
-         "interval-map-edit.rkt"
          "position-journal.rkt"
          "../../common/interfaces.rkt"
          "../../common/path-util.rkt"
          (only-in "../../common/source.rkt" source-file-path)
          "../internal-types.rkt"
-         data/interval-map
+         "../../common/interval-map.rkt"
          drracket/check-syntax
          racket/class
-         racket/dict
          racket/list
          racket/match)
 
@@ -73,17 +70,10 @@
     [(list 'binding path submods phase id) (Module-Binding path submods phase id)]
     [(list 'language start end phase text) (Module-Lang-Use-Key start end phase text)]))
 
-(define (restore-id-owners entries)
+(define (restore-hash table [decode-key values] [decode-value values])
   (make-hash
-    (for/list ([entry (in-list entries)])
-      (match-define (list id owner) entry)
-      (cons id (datum->owner owner)))))
-
-(define (restore-owner-keyed entries)
-  (make-hash
-    (for/list ([entry (in-list entries)])
-      (match-define (list owner value) entry)
-      (cons (datum->owner owner) value))))
+    (for/list ([(key value) (in-hash table)])
+      (cons (decode-key key) (decode-value value)))))
 
 (define declaration%
   (class base-service%
@@ -118,37 +108,44 @@
     ;; All graph references use snapshot-local IDs or explicitly encoded owners.
     ;; walk-stx has resolved pending module-language uses. The fresh receiving
     ;; journal is empty; snapshot ranges remain the baseline for later edits.
+    ;; Internal place-to-place transfer in the same process.
     (define/override (serialize)
-      (hash 'definitions (interval-map->snapshot def-at-position)
-            'uses (interval-map->snapshot use-at-position)
-            'ranges (for/list ([(id range) (in-hash id->range)])
-                      (list id (CharRange-start range) (CharRange-end range)))
-            'definition-uses
-            (for/list ([(owner ids) (in-hash def->use-ids)])
-              (list (owner->datum owner) ids))
-            'use-definitions
-            (for/list ([(id owner) (in-hash use->def)]) (list id (owner->datum owner)))
-            'binding-definitions
-            (for/list ([(binding id) (in-hash module-binding->def-id)])
-              (list (owner->datum binding) id))
-            'definition-bindings
-            (for/list ([(id binding) (in-hash def-id->module-binding)])
-              (list id (owner->datum binding)))))
+      (list (interval-map->snapshot def-at-position)
+            (interval-map->snapshot use-at-position)
+            (for/hash ([(id range) (in-hash id->range)])
+              (values id (cons (CharRange-start range) (CharRange-end range))))
+            (for/hash ([(owner ids) (in-hash def->use-ids)])
+              (values (owner->datum owner) ids))
+            (for/hash ([(id owner) (in-hash use->def)])
+              (values id (owner->datum owner)))
+            (for/hash ([(binding id) (in-hash module-binding->def-id)])
+              (values (owner->datum binding) id))
+            (for/hash ([(id binding) (in-hash def-id->module-binding)])
+              (values id (owner->datum binding)))))
 
     (define/override (deserialize! data)
-      (set! def-at-position (snapshot->interval-map (hash-ref data 'definitions)))
-      (set! use-at-position (snapshot->interval-map (hash-ref data 'uses)))
+      (match-define
+        (list definitions
+              occurrences
+              ranges
+              definition-uses
+              use-definitions
+              binding-definitions
+              definition-bindings)
+        data)
+
+      (set! def-at-position (snapshot->interval-map definitions))
+      (set! use-at-position (snapshot->interval-map occurrences))
       (set! id->range
-            (make-hash
-              (for/list ([entry (in-list (hash-ref data 'ranges))])
-                (match-define (list id start end) entry)
-                (cons id (CharRange start end)))))
+            (restore-hash ranges values (lambda (r) (CharRange (car r) (cdr r)))))
       (set! def->use-ids
-            (restore-owner-keyed (hash-ref data 'definition-uses)))
-      (set! use->def (restore-id-owners (hash-ref data 'use-definitions)))
+            (restore-hash definition-uses datum->owner values))
+      (set! use->def
+            (restore-hash use-definitions values datum->owner))
       (set! module-binding->def-id
-            (restore-owner-keyed (hash-ref data 'binding-definitions)))
-      (set! def-id->module-binding (restore-id-owners (hash-ref data 'definition-bindings))))
+            (restore-hash binding-definitions datum->owner values))
+      (set! def-id->module-binding
+            (restore-hash definition-bindings values datum->owner)))
 
     ;; Lexical arrows and jumps treat a zero-width Check Syntax report as a
     ;; one-character range. Module-language arrows do not call this function.
@@ -278,11 +275,11 @@
     ;; leftover `#lang` uses are omitted; those names must not leave this
     ;; document.
     (define/public (module-binding-uses)
-      (for*/list ([(range use-id) (in-dict use-at-position)]
+      (for*/list ([(start end use-id) (in-interval-map use-at-position)]
                   [def (in-value (hash-ref use->def use-id #f))]
                   [module-binding (in-value (and def (def->module-binding def)))]
                   #:when module-binding)
-        (cons (CharRange (car range) (cdr range)) module-binding)))
+        (cons (CharRange start end) module-binding)))
 
     ;; Each result is (cons live-definition-range Module-Binding). Local-only
     ;; definitions are omitted; those names must not leave this document.
@@ -336,9 +333,9 @@
 
     (define/override (expand start end)
       ;; Typing inside a name must stay one occurrence. Do not use the
-      ;; interval-map default, which splits the range.
-      (interval-map-expand/policy! def-at-position start end #:interior 'extend)
-      (interval-map-expand/policy! use-at-position start end #:interior 'extend)
+      ;; interval-rope-expand default, which splits the range.
+      (interval-map-expand! def-at-position start end #:interior 'extend)
+      (interval-map-expand! use-at-position start end #:interior 'extend)
       (position-journal-record-expand! range-journal start end))
 
     (define/override (contract start end)

@@ -3,15 +3,16 @@
 (require rackunit
          drracket/check-syntax
          racket/class
-         racket/dict
          racket/place
          racket/runtime-path
-         data/interval-map
+         "../../common/interval-map.rkt"
+         "../../common/source.rkt"
          "../../doclib/service/completion.rkt"
+         "../../doclib/service/declaration.rkt"
          "../../doclib/service/interface.rkt"
          "../../doclib/service/require.rkt"
-         "../../doclib/service/interval-map-snapshot.rkt"
-         "../../doclib/internal-types.rkt")
+         "../../doclib/internal-types.rkt"
+         "../../doclib/editor.rkt")
 
 (define-runtime-path worker-path "trace-place-worker.rkt")
 
@@ -44,11 +45,37 @@
     (for ([service (in-list (list original restored))])
       (send service expand 0 2)
       (send service contract 6 7))
-    (check-equal? (dict->list (send restored get)) (dict->list (send original get))))
+    (check-equal? (interval-map->list (send restored get)) (interval-map->list (send original get))))
+
+  (test-case "declaration snapshot restores graph relations and survives edits"
+    (define source (path->source (string->path "/tmp/fake.rkt")))
+    (define doc-text (new lsp-editor%))
+    (send doc-text insert "#lang racket/base\n(define x 1)\n(+ x x)\n" 0)
+    (define original (new declaration% [source source] [doc-text doc-text]))
+    (send original syncheck:add-definition-target/phase-level+space #f 27 28 'x '() 0)
+    (send original syncheck:add-arrow/name-dup #f 27 28 #f 35 36 #t 0 #f #f)
+    (send original syncheck:add-arrow/name-dup #f 27 28 #f 37 38 #t 0 #f #f)
+    (send original walk-stx #f)
+
+    (define serialized (send original serialize))
+    (check-true (place-message-allowed? serialized))
+
+    (define restored (new declaration% [source source] [doc-text doc-text]))
+    (send restored deserialize! serialized)
+
+    (check-equal? (send restored definition-at 27) (send original definition-at 27))
+    (check-equal? (send restored uses-at 27) (send original uses-at 27))
+    (check-equal? (send restored occurrence-at 35) (send original occurrence-at 35))
+
+    (for ([decl (in-list (list original restored))])
+      (send decl expand 0 5)
+      (send decl contract 2 4))
+    (check-equal? (send restored definition-at 30) (send original definition-at 30))
+    (check-equal? (send restored uses-at 30) (send original uses-at 30)))
 
   (test-case "interval snapshots preserve shared identities across a deleted gap"
-    (define intervals (make-interval-map))
     (define shared (list "shared"))
+    (define intervals (make-interval-map))
     (interval-map-set! intervals 0 2 shared)
     (interval-map-set! intervals 4 6 shared)
     ;; Reconstructing lists deliberately prevents accidental reuse by the decoder.
@@ -57,14 +84,15 @@
     (check-eq? (interval-map-ref restored 0) (interval-map-ref restored 4))
     (interval-map-contract! intervals 2 4)
     (interval-map-contract! restored 2 4)
-    (check-equal? (dict->list restored) (dict->list intervals)))
+    (check-equal? (interval-map->list restored)
+                  (interval-map->list intervals)))
 
   (test-case "real place preserves shared and equal-but-distinct interval values"
-    (define intervals (make-interval-map))
     (define shared (list (string-copy "same")))
     (define distinct (list (string-copy "same")))
     (check-equal? shared distinct)
     (check-not-eq? shared distinct)
+    (define intervals (make-interval-map))
     (interval-map-set! intervals 0 2 shared)
     (interval-map-set! intervals 4 6 shared)
     (interval-map-set! intervals 8 10 distinct)
@@ -78,9 +106,10 @@
         (define restored (snapshot->interval-map data))
         (check-eq? (interval-map-ref restored 0) (interval-map-ref restored 4))
         (check-not-eq? (interval-map-ref restored 0) (interval-map-ref restored 8))
-        (for ([map (in-list (list intervals restored))])
-          (interval-map-contract! map 6 8)
-          (interval-map-contract! map 2 4))
-        (check-equal? (length (dict->list restored)) 2)
-        (check-equal? (dict->list restored) (dict->list intervals)))
+        (for ([im (in-list (list intervals restored))])
+          (interval-map-contract! im 6 8)
+          (interval-map-contract! im 2 4))
+        (check-equal? (length (interval-map->list restored)) 2)
+        (check-equal? (interval-map->list restored)
+                      (interval-map->list intervals)))
       (lambda () (place-kill echo)))))

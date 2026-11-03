@@ -51,12 +51,15 @@
          interval-rope-set
          interval-rope-remove
          interval-rope-expand
+         interval-rope-expand/extend
          interval-rope-contract
          interval-rope-update
          interval-rope-cons
          ;; Bulk import and export
          adopt-interval-snapshot
-         interval-rope->list)
+         interval-rope-for-each
+         interval-rope->list
+         in-interval-rope)
 
 ;; Unexported sentinel values for unmapped gaps and absent default values.
 (define *gap* (gensym '*gap*))
@@ -246,6 +249,16 @@
                            "start" start
                            "end" end)))
 
+(define (valid-query-interval! who start end)
+  (unless (exact-integer? start)
+    (raise-argument-error who "exact-integer?" start))
+  (unless (exact-integer? end)
+    (raise-argument-error who "exact-integer?" end))
+  (unless (<= start end)
+    (raise-arguments-error who "query interval start is greater than end"
+                           "start" start
+                           "end" end)))
+
 (define (missing who default [key #f])
   (cond
     [(eq? default *absent*)
@@ -289,9 +302,10 @@
   val)
 
 ;; Return all mapped values overlapping the coordinate range [start, end) in order.
+;; When start = end = pos, selects strictly containing intervals (start < pos < end).
 ;; (-> IntervalRope? exact-integer? exact-integer? (listof any/c))
 (define (interval-rope-overlap-values rope start end)
-  (valid-interval! 'interval-rope-overlap-values start end)
+  (valid-query-interval! 'interval-rope-overlap-values start end)
   (match-define (IntervalRope origin root) rope)
   (let collect ([tree root] [base origin] [acc '()])
     (cond
@@ -364,11 +378,15 @@
 ;; Shift all coordinates at or after `from` rightward by (- to from) (text insertion).
 ;; Uses a 'split strategy for interior insertions by injecting an unmapped *gap* leaf:
 ;; - O(1) if from <= origin (shifts origin directly)
-;; - O(log N) if inside the tree (splits tree at offset and inserts *gap* leaf)
+;; - O(log N) if inside the tree:
+;;   - #:interior 'split inserts a *gap* leaf of width (- to from)
+;;   - #:interior 'extend keeps a strict interior insertion within the same mapped interval
 ;; - O(1) if from is past the tree end (no-op)
-;; (-> IntervalRope? exact-integer? exact-integer? IntervalRope?)
-(define (interval-rope-expand rope from to)
+;; (->* (IntervalRope? exact-integer? exact-integer?) (#:interior (or/c 'split 'extend)) IntervalRope?)
+(define (interval-rope-expand rope from to #:interior [interior 'split])
   (valid-interval! 'interval-rope-expand from to)
+  (unless (memq interior '(split extend))
+    (raise-argument-error 'interval-rope-expand "(or/c 'split 'extend)" interior))
   (match-define (IntervalRope origin root) rope)
   (if (or (tree-empty? root) (zero? (tree-count root)))
       rope
@@ -377,11 +395,24 @@
           [(<= from origin)
            (IntervalRope (+ origin shift) root)]
           [(< from (+ origin (tree-span root)))
-           (define-values (left right) (tree-split-at-offset root (- from origin)))
-           (IntervalRope origin
-                         (tree-concat (tree-concat left (IntervalLeaf shift *gap*))
-                                      right))]
+           (cond
+             [(eq? interior 'extend)
+              (define-values (range-start range-end value)
+                (interval-rope-ref/bounds rope from *gap*))
+              (define expanded (interval-rope-expand rope from to #:interior 'split))
+              (if (and (not (eq? value *gap*))
+                       (< range-start from range-end))
+                  (interval-rope-set expanded range-start (+ range-end shift) value)
+                  expanded)]
+             [else
+              (define-values (left right) (tree-split-at-offset root (- from origin)))
+              (IntervalRope origin
+                            (tree-concat (tree-concat left (IntervalLeaf shift *gap*))
+                                         right))])]
           [else rope]))))
+
+(define (interval-rope-expand/extend rope from to)
+  (interval-rope-expand rope from to #:interior 'extend))
 
 ;; Concatenate two trees after a contraction/deletion, coalescing adjacent
 ;; mapped leaves at the seam if they share identical (eq?) user values.
@@ -478,6 +509,83 @@
        (define right-base (+ base (tree-span left)))
        (collect left base (collect right right-base acc))])))
 
+;; (-> IntervalRope? (-> exact-integer? exact-integer? any/c any) void?)
+(define (interval-rope-for-each rope proc)
+  (match-define (IntervalRope origin root) rope)
+  (let walk ([tree root] [base origin])
+    (cond
+      [(or (tree-empty? tree) (zero? (tree-count tree))) (void)]
+      [(IntervalLeaf? tree)
+       (unless (eq? (IntervalLeaf-value tree) *gap*)
+         (proc base (+ base (IntervalLeaf-span tree)) (IntervalLeaf-value tree))
+         (void))]
+      [else
+       (define left (IntervalNode-left tree))
+       (define right (IntervalNode-right tree))
+       (walk left base)
+       (walk right (+ base (tree-span left)))]))
+  (void))
+
+;; Traverses mapped intervals on demand in O(log N) space using an explicit stack.
+;;
+;; Invariants:
+;; - Values reside only in mapped IntervalLeaf nodes (tree-count > 0, non-*gap*).
+;; - When the stack is non-empty, the top frame is always (cons leaf start-coordinate).
+;; - Deeper frames are (cons pending-subtree base) for unvisited right subtrees with count > 0.
+;; - Subtrees with zero mapped intervals are skipped in O(1) during descent.
+;;
+;; (-> IntervalRope? (sequence/c exact-integer? exact-integer? any/c))
+(define (in-interval-rope rope)
+  (unless (IntervalRope? rope)
+    (raise-argument-error 'in-interval-rope "IntervalRope?" rope))
+  (define origin (IntervalRope-origin rope))
+  (define root (IntervalRope-root rope))
+
+  (define (stack->values stack)
+    (define entry (car stack))
+    (define leaf (car entry))
+    (define start (cdr entry))
+    (values start (+ start (IntervalLeaf-span leaf)) (IntervalLeaf-value leaf)))
+
+  (define (descend tree base stack)
+    (cond
+      [(IntervalLeaf? tree)
+       (cons (cons tree base) stack)]
+      [else
+       (define left (IntervalNode-left tree))
+       (define right (IntervalNode-right tree))
+       (define left-count (tree-count left))
+       (define right-count (tree-count right))
+       (cond
+         [(zero? left-count)
+          (descend right (+ base (tree-span left)) stack)]
+         [(zero? right-count)
+          (descend left base stack)]
+         [else
+          (define right-base (+ base (tree-span left)))
+          (descend left base (cons (cons right right-base) stack))])]))
+
+  (define (advance-stack stack)
+    (if (pair? stack)
+        (let ([entry (car stack)])
+          (descend (car entry) (cdr entry) (cdr stack)))
+        '()))
+
+  (define (next-stack stack)
+    (advance-stack (cdr stack)))
+
+  (make-do-sequence
+    (lambda ()
+      (values
+        stack->values
+        next-stack
+        (if (zero? (tree-count root))
+            '()
+            (descend root origin '()))
+        pair?
+        #f
+        #f))))
+
 ;; Construct an IntervalRope directly from sorted, disjoint start/end/id triples.
 ;; (-> (vectorof exact-integer?) (vectorof any/c) IntervalRope?)
 (define (adopt-interval-snapshot entries decoded)
@@ -489,42 +597,43 @@
   (unless (zero? (remainder total 3))
     (error 'adopt-interval-snapshot "snapshot entries vector length must be a multiple of 3"))
 
-  (if (zero? total)
-      empty-interval-rope
-      (let* ([decoded-len (vector-length decoded)]
-             [leaves (make-vector (* 2 (quotient total 3)) #f)]
-             [used 0]
-             [origin (vector-ref entries 0)]
-             [previous origin])
-        (define (emit! width val)
-          (when (positive? width)
-            (vector-set! leaves used (IntervalLeaf width val))
-            (set! used (add1 used))))
+  (cond
+    [(zero? total) empty-interval-rope]
+    [else
+     (define decoded-len (vector-length decoded))
+     (define leaves (make-vector (* 2 (quotient total 3)) #f))
+     (define used 0)
+     (define origin (vector-ref entries 0))
+     (define previous origin)
+     (define (emit! width val)
+       (when (positive? width)
+         (vector-set! leaves used (IntervalLeaf width val))
+         (set! used (add1 used))))
 
-        (for ([offset (in-range 0 total 3)])
-          (define start (vector-ref entries offset))
-          (define end (vector-ref entries (+ offset 1)))
-          (define id (vector-ref entries (+ offset 2)))
-          (unless (and (exact-integer? start)
-                       (exact-integer? end)
-                       (<= previous start)
-                       (< start end)
-                       (exact-nonnegative-integer? id)
-                       (< id decoded-len))
-            (error 'adopt-interval-snapshot "invalid sorted disjoint snapshot entries"))
-          (emit! (- start previous) *gap*)
-          (emit! (- end start) (vector-ref decoded id))
-          (set! previous end))
+     (for ([offset (in-range 0 total 3)])
+       (define start (vector-ref entries offset))
+       (define end (vector-ref entries (+ offset 1)))
+       (define id (vector-ref entries (+ offset 2)))
+       (unless (and (exact-integer? start)
+                    (exact-integer? end)
+                    (<= previous start)
+                    (< start end)
+                    (exact-nonnegative-integer? id)
+                    (< id decoded-len))
+         (error 'adopt-interval-snapshot "invalid sorted disjoint snapshot entries"))
+       (emit! (- start previous) *gap*)
+       (emit! (- end start) (vector-ref decoded id))
+       (set! previous end))
 
-        (define (build-slice from to)
-          (cond
-            [(= from to) empty-tree]
-            [(= (add1 from) to) (vector-ref leaves from)]
-            [else
-             (define mid (quotient (+ from to) 2))
-             (make-node (build-slice from mid) (build-slice mid to))]))
+     (define (build-slice from to)
+       (cond
+         [(= from to) empty-tree]
+         [(= (add1 from) to) (vector-ref leaves from)]
+         [else
+          (define mid (quotient (+ from to) 2))
+          (make-node (build-slice from mid) (build-slice mid to))]))
 
-        (make-normalized-rope origin (build-slice 0 used)))))
+     (make-normalized-rope origin (build-slice 0 used))]))
 
 ;; -----------------------------------------------------------------------------
 ;; Invariant Verification (Test Support)

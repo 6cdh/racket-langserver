@@ -1,7 +1,6 @@
 #lang racket/base
 
 (require "interface.rkt"
-         "interval-map-snapshot.rkt"
          "../../common/json-util.rkt"
          racket/class
          racket/string
@@ -9,7 +8,7 @@
          racket/match
          racket/list
          setup/path-to-relative
-         data/interval-map
+         "../../common/interval-map.rkt"
          "../../common/interfaces.rkt"
          "../internal-types.rkt"
          (only-in "../lexer.rkt"

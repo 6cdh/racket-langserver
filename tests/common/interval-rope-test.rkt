@@ -11,6 +11,10 @@
   (define (check-rope-equivalence actual expected [probe-keys '(-50 -10 -1 0 1 5 12 25 50 100 200)])
     (rope:check-interval-rope! actual)
     (check-equal? (rope:interval-rope->list actual) (dict->list expected))
+    (check-equal?
+      (for/list ([(start end val) (rope:in-interval-rope actual)])
+        (cons (cons start end) val))
+      (dict->list expected))
     (check-equal? (rope:interval-rope-count actual) (length (dict->list expected)))
     (for ([key (in-list probe-keys)])
       (check-equal?
@@ -81,6 +85,31 @@
                     ((25 . 30) . shared)))
     (check-equal? (rope:interval-rope-count multi-adopted) 3)
     (rope:check-interval-rope! multi-adopted)
+
+    ;; in-interval-rope sequence yields 3 values: start end value
+    (check-equal?
+      (for/list ([(start end val) (rope:in-interval-rope multi-adopted)])
+        (list start end val))
+      '((-50 -20 shared)
+        (-10 10 specific)
+        (25 30 shared)))
+
+    ;; in-interval-rope on empty rope
+    (check-equal?
+      (for/list ([(start end val) (rope:in-interval-rope rope:empty-interval-rope)])
+        (list start end val))
+      '())
+
+    ;; Early termination only evaluates needed elements
+    (check-equal?
+      (for/first ([(start end val) (rope:in-interval-rope multi-adopted)]
+                  #:when (> start -20))
+        (list start end val))
+      '(-10 10 specific))
+
+    ;; in-interval-rope rejects non-IntervalRope
+    (check-exn exn:fail:contract?
+               (lambda () (rope:in-interval-rope 'not-a-rope)))
 
     ;; Validation errors on malformed snapshots
     (check-exn exn:fail:contract?
@@ -166,10 +195,13 @@
     ;; Range past the end: empty
     (check-equal? (rope:interval-rope-overlap-values r 65 100) '())
 
-    ;; Validation error on invalid range
-    (check-exn #rx"strictly less than"
-               (lambda () (rope:interval-rope-overlap-values r 20 20)))
-    (check-exn #rx"strictly less than"
+    ;; Empty / point cursor range: selects strictly containing interval
+    (check-equal? (rope:interval-rope-overlap-values r 15 15) '(a))
+    (check-equal? (rope:interval-rope-overlap-values r 20 20) '())
+    (check-equal? (rope:interval-rope-overlap-values r 25 25) '())
+
+    ;; Validation error on inverted range
+    (check-exn #rx"query interval start is greater than end"
                (lambda () (rope:interval-rope-overlap-values r 30 20))))
 
   ;; ---------------------------------------------------------------------------
@@ -490,4 +522,47 @@
         (rope:check-interval-rope! current-rope))
 
       ;; End of trial verification
-      (check-rope-equivalence current-rope ref))))
+      (check-rope-equivalence current-rope ref)))
+
+  (test-case "interval-rope iteration: for-each"
+    (define r (rope:adopt-interval-snapshot #(10 20 0 30 40 1 50 60 2) #(a b c)))
+    (define collected '())
+    (define ret
+      (rope:interval-rope-for-each r
+                                   (lambda (s e v)
+                                     (set! collected (cons (list s e v) collected)))))
+    (check-equal? (reverse collected)
+                  '((10 20 a) (30 40 b) (50 60 c)))
+    (check-equal? ret (void))
+
+    ;; Callbacks returning zero values or multiple values must not fail
+    (check-not-exn
+      (lambda ()
+        (rope:interval-rope-for-each r (lambda (_s _e _v) (values)))))
+    (check-not-exn
+      (lambda ()
+        (rope:interval-rope-for-each r (lambda (_s _e _v) (values 1 2 3))))))
+
+  (test-case "interval-rope interior expand policies"
+    (define r (rope:adopt-interval-snapshot #(10 20 0) #(sym)))
+    ;; Interior split: splits into two pieces with gap
+    (define r-split (rope:interval-rope-expand r 14 17 #:interior 'split))
+    (check-equal? (rope:interval-rope->list r-split)
+                  '(((10 . 14) . sym) ((17 . 23) . sym)))
+
+    ;; Interior extend: extends existing interval
+    (define r-ext (rope:interval-rope-expand r 14 17 #:interior 'extend))
+    (check-equal? (rope:interval-rope->list r-ext)
+                  '(((10 . 23) . sym)))
+
+    ;; Helper interval-rope-expand/extend
+    (check-equal? (rope:interval-rope->list (rope:interval-rope-expand/extend r 14 17))
+                  '(((10 . 23) . sym)))
+
+    ;; Boundary insertion: preserves split policy
+    (define r-start (rope:interval-rope-expand/extend r 10 13))
+    (check-equal? (rope:interval-rope->list r-start)
+                  '(((13 . 23) . sym)))
+    (define r-end (rope:interval-rope-expand/extend r 20 23))
+    (check-equal? (rope:interval-rope->list r-end)
+                  '(((10 . 20) . sym)))))

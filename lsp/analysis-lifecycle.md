@@ -469,3 +469,24 @@ shrinking, while all existing task and watchdog deadlines remain enforced.
 
 Cache resizing runs on the consumer, immediately evicts least recently used entries
 until the new count bound holds, and preserves open buffers and held completions.
+
+## Trace interval storage and transfer
+
+Both worker collection and receiver queries use immutable interval ropes in
+`doclib/service/`. Each service owns its current rope and replaces that value
+on collection or edits; retained ropes remain snapshots. Declaration ranges
+continue to use the position journal for snapshot-to-live translation.
+Declaration insertions extend strictly interior intervals; other services split
+intervals around inserted text. Contraction preserves identity-based coalescing.
+
+`build-trace%` transfers only completed, unedited traces. Its interval codec
+(`common/interval-map.rkt`) emits flat start/end/value-ID vectors
+and a value vector, preserving `eq?` sharing within each index. Receiver adoption
+builds balanced trees in linear time instead of replaying individual insertions.
+Worker and receiver use the same installed code; these payloads are internal IPC
+formats, without persistent-cache or cross-version support.
+
+Point queries use rope lookup; nonempty quick-fix overlap queries visit only
+intersecting subtrees. Cursor-only code-action requests retain the prior strict
+containment rule. Service query bounds are current observations; callers should
+use those methods rather than retaining a service's rope across edits.

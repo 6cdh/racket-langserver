@@ -1,10 +1,9 @@
 #lang racket/base
 
 (require "interface.rkt"
-         "interval-map-snapshot.rkt"
          racket/class
          "../docs-helpers.rkt"
-         data/interval-map
+         "../../common/interval-map.rkt"
          net/url
          drracket/check-syntax)
 
@@ -44,4 +43,3 @@
             [def-tag (struct-copy url path-url [fragment (def-tag->html-anchor-tag def-tag)])]
             [else path-url]))
         (interval-map-set! docs start end (list (url->string link+tag) def-tag))))))
-
