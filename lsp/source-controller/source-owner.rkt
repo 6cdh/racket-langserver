@@ -8,6 +8,7 @@
          racket/class
          racket/contract
          racket/match
+         racket/path
          "../../common/debug.rkt"
          "../../common/source.rkt"
          "../../common/settings.rkt"
@@ -15,6 +16,7 @@
          "../../doclib/external/resyntax.rkt"
          "../../workspace/source-store.rkt"
          "../../workspace/current.rkt"
+         "../../workspace/state.rkt"
          "../analysis.rkt"
          "../safedoc.rkt"
          "analysis-scheduler.rkt"
@@ -37,6 +39,7 @@
          source-controller-edit!
          source-controller-close!
          source-controller-invalidate!
+         source-controller-disk-changed!
          source-controller-set-notifier!
          source-controller-shutdown!
          source-controller-view
@@ -76,8 +79,14 @@
 
 ;; Private composition root. Subsystem representations and mutable fields
 ;; are available only through their own operations.
+;;
+;; dependencies: Source-Id of an open buffer -> module files its accepted
+;;   analysis loaded, or #f when unknown. Consumer-only.
 (struct/contract Source-Controller
-  ([store Source-Store?]
+  ([workspace Workspace?]
+   [dependencies (hash/c Source-Id? (or/c #f hash?) #:immutable #f)]
+   [(disk-versions #:mutable) (hash/c path? exact-nonnegative-integer? #:immutable #t)]
+   [store Source-Store?]
    [events async-channel?]
    [shutdown semaphore?]
    [reader Disk-Reader?]
@@ -128,7 +137,7 @@
                                    (Analysis-Settings-closed-file-cache-size
                                      default-analysis-settings)])
   (define events (make-async-channel))
-  (Source-Controller (make-source-store) events (make-semaphore 0)
+  (Source-Controller workspace (make-hash) (hash) (make-source-store) events (make-semaphore 0)
                      (make-disk-reader events #:read read #:timeout read-timeout)
                      (make-scheduler events)
                      (make-closed-analysis-cache closed-analysis-limit)
@@ -235,15 +244,93 @@
 ;; that policy belongs here rather than in the scheduler.
 (define (available-analysis controller snapshot)
   (define buffer (source-buffer controller (Source-Snapshot-source snapshot)))
-  (if buffer
-      (with-read-safedoc buffer SafeDoc-available)
-      (find-closed-analysis! (Source-Controller-closed-analysis controller) snapshot)))
+  (define available
+    (if buffer
+        (with-read-safedoc buffer SafeDoc-available)
+        (find-closed-analysis! (Source-Controller-closed-analysis controller) snapshot)))
+  (and available (not (stale-imports? controller (Available-Analysis-product available))) available))
 
 (define (reusable-completion available snapshot)
   (and available
        (eq? (Source-Snapshot-revision snapshot)
             (Source-Snapshot-revision (Available-Analysis-snapshot available)))
        (Available-Analysis-completion-evt available)))
+
+;; Editor state for one analysis: open file buffers supply imports, and
+;; project folders and buffer directories load from source. Reads every buffer
+;; under its read lock; call without holding a buffer lock.
+(define (analysis-context controller)
+  (define buffers
+    (for/fold ([buffers (hash)])
+              ([entry (in-list (source-store-buffers (Source-Controller-store controller)))])
+      (define path (source-file-path (car entry)))
+      (if path
+          (hash-set buffers path
+                    (and (not (hash-has-key? buffers path))
+                         (string->immutable-string (with-read-doc (cdr entry) doc-get-text))))
+          buffers)))
+  (define folders (workspace-folders (Source-Controller-workspace controller)))
+  (Analysis-Context buffers (append folders (map path-only (hash-keys buffers)))
+                    (Source-Controller-disk-versions controller) (box (hash))))
+
+;; Place loads become visible at acceptance; injected work records them while
+;; running. Accepted dependencies are always available to the controller.
+(define (loads? controller source path)
+  (define accepted (hash-ref (Source-Controller-dependencies controller) (source-id source) #f))
+  (define context (scheduled-analysis-context (Source-Controller-scheduler controller) source))
+  (or (and accepted (hash-has-key? accepted path))
+      (and context (hash-has-key? (unbox (Analysis-Context-loaded context)) path))))
+
+;; Restart analysis of every other open buffer that loaded `changed`. Exact
+;; availability is cleared first, so queries wait for facts computed from the
+;; new text.
+(define (refresh-dependents! controller changed)
+  (define path (source-file-path changed))
+  (when path
+    (restart-buffers!
+      controller
+      (for/list ([entry (in-list (source-store-buffers (Source-Controller-store controller)))]
+                 #:unless (equal? (source-id (car entry)) (source-id changed))
+                 #:when (loads? controller (car entry) path))
+        entry))))
+
+;; Enqueue fresh attempts.
+(define (restart-buffers! controller entries)
+  (unless (null? entries)
+    (define context (analysis-context controller))
+    (define scheduler (Source-Controller-scheduler controller))
+    (for ([entry (in-list entries)])
+      (match-define (cons source buffer) entry)
+      (define snapshot (source-controller-snapshot controller source))
+      (when snapshot
+        (with-write-safedoc buffer
+          (lambda (sd)
+            (set-SafeDoc-available! sd #f)
+            (set-SafeDoc-analysis-completion!
+              sd (restart-analysis! scheduler snapshot
+                                    #:context (struct-copy Analysis-Context context
+                                                [loaded (box (hash))])))))))))
+
+;; Compare each loaded buffer or disk version with the current source state.
+(define (stale-imports? controller product)
+  (define dependencies (Analysis-Product-dependencies product))
+  (and dependencies
+       (let ([buffers
+              (for/fold ([buffers (hash)])
+                        ([entry (in-list (source-store-buffers (Source-Controller-store controller)))])
+                (define path (source-file-path (car entry)))
+                (if (and path (hash-has-key? dependencies path))
+                    (hash-set buffers path
+                              (and (not (hash-has-key? buffers path))
+                                   (with-read-doc (cdr entry) doc-get-text)))
+                    buffers))])
+         (for/or ([(path dependency) (in-hash dependencies)])
+           (if (Disk-Dependency? dependency)
+               (or (hash-has-key? buffers path)
+                   (not (= (Disk-Dependency-version dependency)
+                           (hash-ref (Source-Controller-disk-versions controller) path 0))))
+               (or (not (hash-has-key? buffers path))
+                   (not (equal? dependency (hash-ref buffers path)))))))))
 
 (define (prepare-analysis! controller snapshot refresh?)
   (cond
@@ -255,7 +342,7 @@
      (define active (scheduled-analysis-event scheduler source))
      (define available (and (not refresh?) (available-analysis controller snapshot)))
      (define reused (and (not refresh?) (not active) (reusable-completion available snapshot)))
-     (define event (or reused (request-analysis! scheduler snapshot)))
+     (define event (or reused (request-analysis! scheduler snapshot #:context (analysis-context controller))))
      (define buffer (source-buffer controller source))
      (when buffer
        (with-write-safedoc buffer (lambda (sd) (set-SafeDoc-analysis-completion! sd event))))
@@ -283,7 +370,16 @@
 (define (record-analysis! controller snapshot product completion)
   (define source (Source-Snapshot-source snapshot))
   (define succeeded? (Analysis-Product-succeeded? product))
+  (when (and succeeded?
+             (not (and (Analysis-Product-summary product)
+                       (if (source-file-path source)
+                           (Analysis-Product-contribution product)
+                           (not (Analysis-Product-contribution product))))))
+    (error 'record-analysis! "successful analysis requires facts and a file-only contribution"))
   (define buffer (source-buffer controller source))
+  (when buffer
+    (hash-set! (Source-Controller-dependencies controller) (source-id source)
+               (Analysis-Product-dependencies product)))
   (cond
     [buffer
      (with-write-safedoc buffer
@@ -304,6 +400,10 @@
       (cond
         [(not (snapshot-current? controller snapshot)) (Analysis-Outcome 'stopped 'source-changed)]
         [(Analysis-Outcome? result) result]
+        [(and (eq? kind 'check-syntax) (stale-imports? controller result))
+         (define buffer (source-buffer controller source))
+         (when buffer (restart-buffers! controller (list (cons source buffer))))
+         (Analysis-Outcome 'stopped 'dependency-changed)]
         [(eq? kind 'check-syntax) (record-analysis! controller snapshot result completion)]
         [else
          (define buffer (source-buffer controller source))
@@ -314,6 +414,8 @@
   (define succeeded? (eq? 'succeeded (Analysis-Outcome-state outcome)))
   (case kind
     [(check-syntax)
+     (when (eq? 'failed (Analysis-Outcome-state outcome))
+       (hash-set! (Source-Controller-dependencies controller) (source-id source) #f))
      (unless succeeded? (discard-analysis! controller source))
      (when (and succeeded? (source-buffer controller source) (get-resyntax-enabled))
        (schedule-resyntax! (Source-Controller-scheduler controller) snapshot))]
@@ -339,8 +441,11 @@
   (define snapshot (and available (source-controller-snapshot controller source)))
   (when (and available
              (equal? (Source-Snapshot-text snapshot)
-                     (Source-Snapshot-text (Available-Analysis-snapshot available))))
+                     (Source-Snapshot-text (Available-Analysis-snapshot available)))
+             (not (stale-imports? controller (Available-Analysis-product available))))
     (define product (Available-Analysis-product available))
+    (hash-set! (Source-Controller-dependencies controller) (source-id source)
+               (Analysis-Product-dependencies product))
     (define restored-product
       (struct-copy Analysis-Product product
         [contribution (send (Analysis-Product-trace product) get-contribution
@@ -348,7 +453,8 @@
     (with-write-safedoc safe-doc
       (lambda (sd)
         (publish-document-analysis! (Source-Controller-publisher controller) sd snapshot restored-product))))
-  (source-controller-refresh-analysis! controller source))
+  (source-controller-refresh-analysis! controller source)
+  (refresh-dependents! controller source))
 
 ;; Clear the buffer's fresh completion and available result. The document
 ;; trace stays in place.
@@ -373,7 +479,8 @@
         (cancel-source-analysis! (Source-Controller-scheduler controller) source)
         (mutate-doc (SafeDoc-doc sd))
         source)))
-  (source-controller-refresh-analysis! controller source))
+  (source-controller-refresh-analysis! controller source)
+  (refresh-dependents! controller source))
 
 ;; Drop buffer authority without a read. File content becomes unknown; virtual
 ;; sources are removed because they have no disk fallback. Retain a completed
@@ -395,14 +502,32 @@
         (set-SafeDoc-source-view! sd #f)
         (clear-analysis-projections! sd)
         (Doc-uri (SafeDoc-doc sd)))))
+  (cancel-source-analysis! (Source-Controller-scheduler controller) source)
+  (hash-remove! (Source-Controller-dependencies controller) (source-id source))
   (withdraw-document-analysis! (Source-Controller-publisher controller) source uri)
-  (cancel-read! controller source))
+  (cancel-read! controller source)
+  (refresh-dependents! controller source))
+
+;; A watched change to an open file does not replace the authoritative editor
+;; buffer. It still advances the disk version for attempts and retained products.
+(define (source-controller-disk-changed! controller source)
+  (when (source-file-path source)
+    (if (source-store-buffer (Source-Controller-store controller) source)
+        (advance-disk-version! controller source)
+        (source-controller-invalidate! controller source))))
+
+(define (advance-disk-version! controller source)
+  (define path (source-file-path source))
+  (define versions (Source-Controller-disk-versions controller))
+  (set-Source-Controller-disk-versions! controller
+                                        (hash-set versions path (add1 (hash-ref versions path 0)))))
 
 ;; Files only. Drop retained data and cached disk text. An open buffer keeps
 ;; its document, gets a new revision, and is re-analyzed. A file without a
 ;; buffer returns to unknown disk without reading.
 (define (source-controller-invalidate! controller source)
   (when (source-file-path source)
+    (advance-disk-version! controller source)
     (discard-closed-analysis! (Source-Controller-closed-analysis controller) source)
     (define store (Source-Controller-store controller))
     (define buffer (source-store-buffer store source))
@@ -414,7 +539,8 @@
         (source-store-invalidate! store source))
     (cancel-source-analysis! (Source-Controller-scheduler controller) source)
     (cancel-read! controller source)
-    (when buffer (source-controller-refresh-analysis! controller source))))
+    (when buffer (source-controller-refresh-analysis! controller source))
+    (refresh-dependents! controller source)))
 
 ;; Subsystems settle their own pending work. Shutdown does not inspect tables,
 ;; queues, attempts, workers, or completion-event representations.

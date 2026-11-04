@@ -20,7 +20,9 @@
          make-analysis-scheduler
          configure-analysis-scheduler!
          scheduled-analysis-event
+         scheduled-analysis-context
          request-analysis!
+         restart-analysis!
          schedule-resyntax!
          cancel-source-analysis!
          stop-analysis-scheduler!
@@ -41,6 +43,7 @@
 ;; task: Opaque pool handle for cancellation; not a worker identity.
 (struct/contract Analysis-Attempt
   ([snapshot Source-Snapshot?]
+   [context (or/c #f Analysis-Context?)]
    [kind (or/c 'check-syntax 'resyntax)]
    [completion Completion-Event?]
    [deadline real?]
@@ -99,21 +102,29 @@
 (define (registered? scheduler attempt)
   (eq? attempt (hash-ref (Analysis-Scheduler-attempts scheduler) (attempt-key attempt) #f)))
 
+(define (active-check-syntax-attempt scheduler source)
+  (hash-ref (Analysis-Scheduler-attempts scheduler) (cons (source-id source) 'check-syntax) #f))
+
 (define (scheduled-analysis-event scheduler source)
-  (define attempt
-    (hash-ref (Analysis-Scheduler-attempts scheduler) (cons (source-id source) 'check-syntax) #f))
+  (define attempt (active-check-syntax-attempt scheduler source))
   (and attempt (Analysis-Attempt-completion attempt)))
 
-(define (enqueue! scheduler snapshot kind)
+;; Import context of the queued or running analysis for `source`, or #f.
+(define (scheduled-analysis-context scheduler source)
+  (define attempt (active-check-syntax-attempt scheduler source))
+  (and attempt (Analysis-Attempt-context attempt)))
+
+(define (enqueue! scheduler snapshot kind [context #f])
   (define deadline
     (deadline-after-seconds (Analysis-Scheduler-timeout scheduler)))
   (define attempt
-    (Analysis-Attempt snapshot kind (make-completion-event) deadline #f))
+    (Analysis-Attempt snapshot context kind (make-completion-event) deadline #f))
   (hash-set! (Analysis-Scheduler-attempts scheduler) (attempt-key attempt) attempt)
   (define injection
     (if (eq? kind 'check-syntax)
         (and (Analysis-Scheduler-analyze scheduler)
-             (lambda () ((Analysis-Scheduler-analyze scheduler) snapshot)))
+             (lambda () (parameterize ([current-analysis-context context])
+                          ((Analysis-Scheduler-analyze scheduler) snapshot))))
         (and (procedure? (Analysis-Scheduler-resyntax scheduler))
              (lambda () ((Analysis-Scheduler-resyntax scheduler)
                          (Source-Snapshot-text snapshot) (Source-Snapshot-uri snapshot))))))
@@ -123,15 +134,14 @@
                             (Analysis-Scheduler-check-syntax-runner scheduler)
                             (Analysis-Scheduler-resyntax-runner scheduler))
                         snapshot (Analysis-Scheduler-events scheduler) deadline
-                        (lambda (result) (Analysis-Completed attempt result)) #:work injection))
+                        (lambda (result) (Analysis-Completed attempt result)) #:work injection #:context context))
   (Analysis-Attempt-completion attempt))
 
 ;; Requests for the same revision share an attempt. A successor revision
 ;; supersedes outstanding work for this source, including its Resyntax.
-(define (request-analysis! scheduler snapshot)
+(define (request-analysis! scheduler snapshot #:context [context #f])
   (define source (Source-Snapshot-source snapshot))
-  (define active
-    (hash-ref (Analysis-Scheduler-attempts scheduler) (cons (source-id source) 'check-syntax) #f))
+  (define active (active-check-syntax-attempt scheduler source))
   (cond
     [(and active
           (eq? (Source-Snapshot-revision snapshot)
@@ -139,7 +149,11 @@
      (Analysis-Attempt-completion active)]
     [else
      (cancel-source-analysis! scheduler source)
-     (enqueue! scheduler snapshot 'check-syntax)]))
+     (enqueue! scheduler snapshot 'check-syntax context)]))
+
+(define (restart-analysis! scheduler snapshot #:context context)
+  (cancel-source-analysis! scheduler (Source-Snapshot-source snapshot) 'dependency-changed)
+  (enqueue! scheduler snapshot 'check-syntax context))
 
 ;; Called once after accepting Check Syntax. Starting that attempt already
 ;; cancelled any earlier Resyntax work for the source.
@@ -149,7 +163,8 @@
   (void))
 
 (define (settle! scheduler attempt outcome)
-  (hash-remove! (Analysis-Scheduler-attempts scheduler) (attempt-key attempt))
+  (when (registered? scheduler attempt)
+    (hash-remove! (Analysis-Scheduler-attempts scheduler) (attempt-key attempt)))
   (resolve-completion! (Analysis-Attempt-completion attempt) outcome))
 
 ;; Revoke acceptance on the owner immediately. That kind's pool handles physical cleanup.
@@ -184,5 +199,9 @@
               (Analysis-Attempt-completion attempt)
               (if (>= (current-deadline-milliseconds) (Analysis-Attempt-deadline attempt))
                   (Analysis-Outcome 'failed 'analysis-timeout)
-                  (Analysis-Completed-result message))))
-    (settle! scheduler attempt outcome)))
+                  (let ([result (Analysis-Completed-result message)])
+                    (if (Analysis-Product? result)
+                        (add-disk-dependency-versions result (Analysis-Attempt-context attempt))
+                        result)))))
+    (when (registered? scheduler attempt)
+      (settle! scheduler attempt outcome))))

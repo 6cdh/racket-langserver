@@ -19,6 +19,8 @@
 ;; Canonical cross-file ownership and lifecycle contracts are defined in analysis-lifecycle.md.
 
 (require "analysis-place-protocol.rkt"
+         "../common/source-snapshot.rkt"
+         "../common/path-util.rkt"
          racket/async-channel
          racket/class
          racket/contract
@@ -38,8 +40,8 @@
 
 ;; Holds a dynamically loaded analysis adapter procedure.
 (struct/contract Loaded-Adapter
-  ([adapter (-> string? string?
-                (or/c Place-Check-Syntax-Result? Place-Resyntax-Result?))])
+  ([adapter (-> string? (or/c string? Place-Source-Context?)
+                (or/c Place-Check-Syntax-Result? Place-Context-Result? Place-Resyntax-Result?))])
   #:transparent)
 
 ;; Internal event envelope delivering the result of adapter stack initialization.
@@ -49,7 +51,7 @@
 
 ;; Internal event envelope delivering the result of an analysis job execution.
 (struct/contract Job-Finished
-  ([outcome (or/c Place-Failure? Place-Check-Syntax-Result? Place-Resyntax-Result?)])
+  ([outcome (or/c Place-Failure? Place-Check-Syntax-Result? Place-Context-Result? Place-Resyntax-Result?)])
   #:transparent)
 
 ;; Tracks an in-flight asynchronous operation (adapter initialization or job execution).
@@ -67,8 +69,8 @@
 
 ;; Holds the initialized adapter and its persistent custodian for the worker's lifetime.
 (struct/contract Analysis-Stack
-  ([adapter (-> string? string?
-                (or/c Place-Check-Syntax-Result? Place-Resyntax-Result?))]
+  ([adapter (-> string? (or/c string? Place-Source-Context?)
+                (or/c Place-Check-Syntax-Result? Place-Context-Result? Place-Resyntax-Result?))]
    [custodian custodian?])
   #:transparent)
 
@@ -89,6 +91,12 @@
 ;; Third-party module caches and arbitrary readers or macros are not transactional:
 ;; custodian shutdown cannot roll back shared mutation or preempt non-yielding native code.
 ;; The manager's cleanup watchdog retains hard place retirement as a fallback for those cases.
+(define (record-load! loaded path text)
+  (let retry ()
+    (define previous (unbox loaded))
+    (unless (box-cas! loaded previous (hash-set previous path text))
+      (retry))))
+
 (define (load-adapter kind)
   (match kind
     ['check-syntax
@@ -97,9 +105,25 @@
      (define trace (dynamic-require syntax-path 'CSResult-trace))
      (define succeeded? (dynamic-require syntax-path 'CSResult-succeed?))
      (lambda (uri text)
-       (define result (check (make-doc uri text)))
-       (Place-Check-Syntax-Result (succeeded? result)
-                                  (send (trace result) serialize)))]
+       (cond
+         [(Place-Source-Context? text)
+          (define doc-text (Place-Source-Context-text text))
+          (define buffers (Place-Source-Context-buffers text))
+          (define roots (Place-Source-Context-roots text))
+          (define loaded (box (hash)))
+          (define result
+            (call-with-source-snapshot
+              buffers
+              #:source? (lambda (path)
+                          (for/or ([root (in-list roots)])
+                            (directory-contains? root path)))
+              #:on-load (lambda (path)
+                          (record-load! loaded path (hash-ref buffers path #f)))
+              (lambda () (check (make-doc uri doc-text)))))
+          (Place-Context-Result (succeeded? result) (send (trace result) serialize) (unbox loaded))]
+         [else
+          (define result (check (make-doc uri text)))
+          (Place-Check-Syntax-Result (succeeded? result) (send (trace result) serialize))]))]
 
     ['resyntax
      ((dynamic-require resyntax-path 'prepare-resyntax!))

@@ -14,9 +14,15 @@
          "../doclib/hover.rkt"
          "../doclib/doc-trace.rkt"
          "../doclib/internal-types.rkt"
+         "../common/path-util.rkt"
+         "../common/source-snapshot.rkt"
          "../workspace/source-store.rkt")
 
 (provide restore-analysis
+         current-analysis-context
+         (struct-out Analysis-Context)
+         (struct-out Disk-Dependency)
+         add-disk-dependency-versions
          (struct-out Analysis-Summary)
          (struct-out Analysis-Product)
          (struct-out Analysis-Outcome)
@@ -29,6 +35,8 @@
    [hover-summaries (hash/c Module-Binding? Hover-Code-Summary? #:immutable #t)])
   #:transparent)
 
+(struct/contract Disk-Dependency ([version exact-nonnegative-integer?]) #:transparent)
+
 ;; One Check Syntax run in a worker.
 ;;
 ;; succeeded?: True when this product's Check Syntax run reported success.
@@ -39,13 +47,61 @@
 ;; trace: Mutable trace. The source controller is its only consumer.
 ;; contribution: Workspace contribution after successful analysis of a file.
 ;;   `#f` when the run produced no facts or the source has no file path.
+;; dependencies: Loaded module path -> buffer text, #f for conflicting open
+;;   buffers, or Disk-Dependency for disk text with its observed invalidation
+;;   version. Raw worker products use #f for disk until the scheduler attaches
+;;   versions. The whole field is #f when dependencies are unknown.
 (struct/contract Analysis-Product
   ([succeeded? boolean?]
    [summary (or/c #f Analysis-Summary?)]
    [diagnostics (listof jsexpr?)]
    [trace (is-a?/c build-trace%)]
-   [contribution (or/c #f Doc-Contribution?)])
+   [contribution (or/c #f Doc-Contribution?)]
+   [dependencies (or/c #f (hash/c path? (or/c #f string? Disk-Dependency?) #:immutable #t))])
   #:transparent)
+
+;; A plain mutable box for CAS publication of plain immutable load tables.
+(define (load-record? value)
+  (and (box? value)
+       (not (immutable? value))
+       (not (impersonator? value))
+       (let ([table (unbox value)])
+         (and (hash? table) (immutable? table) (not (impersonator? table))))))
+
+;; Immutable view of the session's editor state for one analysis attempt.
+;;
+;; buffers: Complete normalized path -> open buffer text, or `#f` when two
+;;   buffers claim one path. Imports read these instead of disk files.
+;; roots: Directories whose modules load from source rather than from
+;;   compiled intermediates.
+;; disk-versions: File invalidation versions captured at submission. A missing
+;;   path has version zero. The owner increments versions on watched changes.
+;; loaded: Box of an immutable table from module file to the buffer text it
+;;   read or `#f`. This attempt's worker replaces the table with `box-cas!`
+;;   while it expands. One box per attempt. The controller reads it while the
+;;   worker may be killed; a mutable table could be left locked by the kill.
+(struct/contract Analysis-Context
+  ([buffers (hash/c path? (or/c #f string?) #:immutable #t)]
+   [roots (listof path?)]
+   [disk-versions (hash/c path? exact-nonnegative-integer? #:immutable #t)]
+   [loaded load-record?])
+  #:transparent)
+
+;; The worker reports disk loads as #f. Bind them to the owner's version at
+;; submission, before the product can be accepted or retained.
+(define (add-disk-dependency-versions product context)
+  (define dependencies (Analysis-Product-dependencies product))
+  (if (and context dependencies)
+      (struct-copy Analysis-Product product
+        [dependencies
+         (for/hash ([(path text) (in-hash dependencies)])
+           (values path (if (and (not text) (not (hash-has-key? (Analysis-Context-buffers context) path)))
+                            (Disk-Dependency (hash-ref (Analysis-Context-disk-versions context) path 0))
+                            text)))])
+      product))
+
+;; Set by the scheduler for each attempt. `#f` analyses with ordinary loading.
+(define current-analysis-context (make-parameter #f))
 
 ;; Terminal result of one Check Syntax or Resyntax attempt.
 ;;
@@ -104,31 +160,35 @@
     [(list? value) (map freeze-json value)]
     [else value]))
 
-;; Direct collection remains a test reference and ordinary-thread benchmark
-;; baseline. Production Check Syntax runs only in the place pool.
+(define (record-load! loaded path text)
+  (let retry ()
+    (define table (unbox loaded))
+    (unless (box-cas! loaded table (hash-set table path text)) (retry))))
+
 (module+ test-support
   (require "../doclib/check-syntax.rkt")
-  (provide analyze-source)
-
+  (provide analyze-source record-load!)
   (define (analyze-source snapshot)
     (define doc (make-source-doc (Source-Snapshot-source snapshot) (Source-Snapshot-text snapshot)))
-    (define check-syntax-result (doc-check-syntax doc))
-    (finalize-analysis doc (CSResult-trace check-syntax-result)
-                       (CSResult-succeed? check-syntax-result))))
+    (define context (current-analysis-context))
+    (define result
+      (if context
+          (call-with-source-snapshot
+            (Analysis-Context-buffers context)
+            #:source? (lambda (path) (for/or ([root (in-list (Analysis-Context-roots context))]) (directory-contains? root path)))
+            #:on-load (lambda (path) (record-load! (Analysis-Context-loaded context) path (hash-ref (Analysis-Context-buffers context) path #f)))
+            (lambda () (doc-check-syntax doc)))
+          (doc-check-syntax doc)))
+    (finalize-analysis doc (CSResult-trace result) (CSResult-succeed? result)
+                       (and context (unbox (Analysis-Context-loaded context))))))
 
-;; Production receiving boundary. The submitted snapshot supplies source identity
-;; and text; the completed worker trace supplies facts, including error results.
-;; The place channel has already established the payload's transferability.
-;; Constructing the document performs local lexing, but never Check Syntax.
 (define/contract (restore-analysis snapshot succeeded? data)
   (-> Source-Snapshot? boolean? any/c Analysis-Product?)
   (define doc (make-source-doc (Source-Snapshot-source snapshot) (Source-Snapshot-text snapshot)))
   (define trace (doc-deserialize-trace! doc data))
-  (finalize-analysis doc trace succeeded?))
+  (finalize-analysis doc trace succeeded? #f))
 
-;; Shared by direct collection and restoration so diagnostics, summaries, and
-;; contributions follow the same installation and extraction rules.
-(define (finalize-analysis doc trace succeeded?)
+(define (finalize-analysis doc trace succeeded? dependencies)
   (define contribution (and succeeded? (send trace get-contribution)))
   (when succeeded?
     (doc-update-trace! doc trace contribution (Doc-version doc)))
@@ -136,4 +196,4 @@
                     (and succeeded? (Analysis-Summary (doc-definition-ranges doc)
                                                       (doc-hover-summaries doc)))
                     (freeze-json (->jsexpr (set->list (send trace get-warn-diags))))
-                    trace contribution))
+                    trace contribution dependencies))

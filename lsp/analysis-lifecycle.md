@@ -333,6 +333,41 @@ native mutations. Interrupted real Check Syntax and installed Resyntax tests
 establish specific cleanup and reuse cases, not universal transactional
 isolation.
 
+The controller receives its publication workspace through `#:workspace`.
+The default remains the process's `current-workspace`, also used by existing
+workspace requests. Injecting a different publication workspace alone does not
+create an isolated LSP session; the request layer must use that same workspace.
+Its folders are also project roots for imported modules, as described below.
+
+## Imports from open buffers
+
+Each analysis attempt carries an `Analysis-Context`: an immutable table of the
+open file buffers taken when the attempt is requested, the project roots, and a
+table of every module file the expansion loads, returned by the worker. An import
+of a file with an open buffer reads that buffer, unsaved edits included. Two
+buffers for one path make that import an error rather than a choice between
+them. Modules below a workspace folder or the directory of an open buffer load
+from source, so a compiled file written before an unsaved or saved change
+cannot keep an older macro expansion. Libraries in installed collections keep
+ordinary compiled loading, even below a project root. Analysis never writes
+compiled files.
+
+The controller keeps, for each open buffer, the module files its accepted
+analysis loaded. Opening, editing or closing a buffer restarts other open
+buffers whose accepted analysis loaded that file. Place attempts report their
+loads on completion, so newly loaded dependencies are checked at acceptance
+rather than triggering an immediate restart. A restart supersedes outstanding
+work for the same revision and clears exact availability first. Acceptance
+compares the buffer texts an analysis read with the current buffers. For disk
+imports, it compares the file invalidation version captured at submission with
+the current version. Watched-file events advance that version, including while
+an attempt is running, and retained results keep the version they observed.
+A stale product is not installed. An open buffer gets another attempt; a
+closed-file caller receives a stopped outcome and may request analysis again.
+Reopening a retained product restores its dependency record before publishing,
+so later changes invalidate it while fresh analysis is pending. Disk freshness
+relies on the client reporting file changes.
+
 ## Available results and fresh completion
 
 `SafeDoc-available` holds a completed product and the snapshot it analyzed.

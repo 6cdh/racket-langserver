@@ -63,9 +63,13 @@
   (when (pair? added)
     (republish-open-doc-contributions!)))
 
-;; Status: ignored. Watched-file events do not own the editor buffer or index.
-(define (didChangeWatchedFiles _params)
-  (void))
+;; Watched files update disk authority; an open editor buffer remains authoritative.
+(define (didChangeWatchedFiles params)
+  (match-define (^DidChangeWatchedFilesParams #:changes changes) params)
+  (for ([change (in-list changes)])
+    (match-define (FileEvent #:uri uri #:type _) change)
+    (when (file-uri? uri)
+      (source-controller-disk-changed! (current-source-controller) (uri->source uri)))))
 
 (define (apply-langserver-settings settings)
   (match-define (Langserver-Settings #:resyntax resyntax

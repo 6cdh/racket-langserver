@@ -53,7 +53,8 @@
                    async-channel?
                    real?
                    (-> any/c any/c))
-                 (#:work (or/c #f (-> any/c)))
+                 (#:work (or/c #f (-> any/c))
+                  #:context (or/c #f Analysis-Context?))
                  Place-Task?)]
            [cancel-place-task!
             (-> Place-Task? void?)]
@@ -98,7 +99,8 @@
    [directory path?]
    [events async-channel?]
    [done (-> any/c any/c)]
-   [work (or/c #f (-> any/c))]))
+   [work (or/c #f (-> any/c))]
+   [context (or/c #f Analysis-Context?)]))
 
 ;; Physical place process and its initialization state, decoupled from any single task.
 ;;
@@ -288,10 +290,10 @@
             Place-Runner?)]
       [spawn-worker (-> procedure? place?)])))
 
-(define (submit-place-task! runner snapshot events deadline done #:work [work #f])
+(define (submit-place-task! runner snapshot events deadline done #:work [work #f] #:context [context #f])
   (define task
     (Place-Task runner snapshot deadline (current-directory)
-                events done work))
+                events done work context))
   (call-with-semaphore
     (Place-Runner-gate runner)
     (lambda ()
@@ -479,10 +481,17 @@
   (define input (Place-Task-snapshot task))
   (set-Slot-phase! slot 'executing)
   (set-Slot-watchdog-deadline! slot #f)
+  (define context (Place-Task-context task))
+  (define payload
+    (if context
+        (Place-Source-Context (Source-Snapshot-text input)
+                              (Analysis-Context-buffers context)
+                              (Analysis-Context-roots context))
+        (Source-Snapshot-text input)))
   (place-channel-put (Worker-place (Slot-worker slot))
                      (Place-Start (Slot-assignment-id slot)
                                   (Source-Snapshot-uri input)
-                                  (Source-Snapshot-text input)
+                                  payload
                                   (Place-Task-directory task))))
 
 ;; Dispatches code loading in the worker place. Newly spawned places use the remainder
@@ -571,6 +580,16 @@
 
        [(Place-Cancelled)
         (clear-slot-assignment! pool slot)]
+
+       [(Place-Context-Result success? data dependencies)
+        (if (active-task? pool task)
+            (start-parent-work! pool slot task
+                                (lambda ()
+                                  (struct-copy Analysis-Product
+                                               ((Pool-analysis-restorer pool) (Place-Task-snapshot task) success? data)
+                                    [dependencies dependencies]))
+                                'restoring)
+            (clear-slot-assignment! pool slot))]
 
        [(Place-Check-Syntax-Result success? data)
         (if (active-task? pool task)

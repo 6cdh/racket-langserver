@@ -618,7 +618,7 @@
         #:analyze (lambda (snapshot)
                     (define product ((controlled-analyzer probes) snapshot))
                     (if fail-next?
-                        (Analysis-Product #f #f '() (Analysis-Product-trace product) #f)
+                        (Analysis-Product #f #f '() (Analysis-Product-trace product) #f #f)
                         product)))
       (lambda (session)
         (define path (build-path scratch "unchanged-client-version.rkt"))
@@ -659,7 +659,37 @@
                     (release-gate! (await probes))
                     (check-eq? 'succeeded (Analysis-Outcome-state (await queued)))
                     (close! session b)
-                    (barrier session)))))
+                    (barrier session))))
+
+  (test-case "malformed acceptance is terminal and releases a slot for queued work"
+    (define probes (make-async-channel))
+    (with-session
+      (make-source-controller
+        #:analysis-slots 1
+        #:analyze (lambda (snapshot)
+                    (define product ((controlled-analyzer probes) snapshot))
+                    (define path (source-file-path (Source-Snapshot-source snapshot)))
+                    (if (regexp-match? #rx"bad-product" (path->string path))
+                        (Analysis-Product #t (Analysis-Product-summary product) '()
+                                          (Analysis-Product-trace product) #f #f)
+                        product)))
+      (lambda (session)
+        (define a (build-path scratch "bad-product.rkt"))
+        (define b (build-path scratch "good-product.rkt"))
+        (open! session a text)
+        (define first-probe (await probes))
+        (open! session b text)
+        (barrier session)
+        (define first (acquire session a))
+        (define queued (acquire session b))
+        (release-gate! first-probe)
+        (check-eq? 'failed (Analysis-Outcome-state (await first)))
+        (check-equal? (notifications session) '())
+        (release-gate! (await probes))
+        (check-eq? 'succeeded (Analysis-Outcome-state (await queued)))
+        (close! session a)
+        (close! session b)
+        (barrier session)))))
 
 (module+ test
   (test-case "shared Resyntax worker death discards findings and the next revision recovers"

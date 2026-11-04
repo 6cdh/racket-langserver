@@ -25,6 +25,8 @@
          (struct-out Place-Failure)
          (struct-out Place-Cancelled)
          (struct-out Place-Check-Syntax-Result)
+         (struct-out Place-Source-Context)
+         (struct-out Place-Context-Result)
          (struct-out Place-Resyntax-Result))
 
 (struct Place-Prepare (kind) #:prefab)
@@ -49,3 +51,15 @@
 
 ;; `findings` is a JSON-convertible list.
 (struct Place-Resyntax-Result (findings) #:prefab)
+
+;; Open-buffer analysis input context.
+;; text: Document source text to analyze.
+;; buffers: Complete normalized path -> buffer text (or #f on path collision).
+;; roots: Project directory paths whose modules load from source rather than bytecode.
+(struct Place-Source-Context (text buffers roots) #:prefab)
+
+;; Check Syntax result with recorded dependencies.
+;; success?: Whether Check Syntax succeeded.
+;; trace: Serialized document trace.
+;; dependencies: Loaded module file -> buffer text read (or #f if read from disk).
+(struct Place-Context-Result (success? trace dependencies) #:prefab)

@@ -35,6 +35,7 @@
            source-controller-edit!
            source-controller-close!
            source-controller-invalidate!
+           source-controller-disk-changed!
            source-controller-set-notifier!
            source-controller-shutdown!
            source-controller-view
