@@ -7,7 +7,6 @@
          racket/file
          racket/list
          racket/path
-         racket/runtime-path
          racket/string
          "../../common/interfaces.rkt"
          "../../common/json-util.rkt"
@@ -179,46 +178,45 @@
                       (close! session path)
                       (barrier session))))))
 
-(define-runtime-path doc-location "../../doclib/doc.rkt")
-(define doc-path (simplify-path doc-location #f))
-
 (module+ test
-  (test-case "doc-check-syntax definition jump survives closing doc.rkt while target refresh is held"
+  (test-case "definition jump survives closing its target while target refresh is held"
     (define gates (make-async-channel))
     (with-files
       (lambda (root)
         (define a (build-path root "jump.rkt"))
-        (define source (format "#lang racket/base\n(require (file ~s))\ndoc-check-syntax\n"
-                               (path->string doc-path)))
+        (define target (build-path root "target.rkt"))
+        (define source "#lang racket/base\n(require \"target.rkt\")\ntarget-value\n")
+        (define target-text "#lang racket/base\n(provide target-value)\n(define target-value 42)\n")
         (write-text a source)
+        (write-text target target-text)
         (with-session
           (make-source-controller
             #:resyntax #f
             #:analyze (lambda (snapshot)
                         (if (equal? (Source-Snapshot-id snapshot)
-                                    (source-id (path->source doc-path)))
+                                    (source-id (path->source target)))
                             ((analyzer gates) snapshot)
                             (analyze-source snapshot))))
           (lambda (session)
             (open! session a source)
             (barrier session)
             (await-analysis (acquire session a))
-            (open! session doc-path (file->string doc-path))
+            (open! session target target-text)
             (release-gate! (await gates))
             (barrier session)
-            (define accepted (await-analysis (acquire session doc-path)))
+            (define accepted (await-analysis (acquire session target)))
             (check-eq? 'succeeded (Analysis-Outcome-state accepted))
             (define expected (query session a 440 "textDocument/definition" (Pos 2 0)))
-            (check-equal? (hash-ref expected 'uri) (path->uri doc-path))
-            (close! session doc-path)
+            (check-equal? (hash-ref expected 'uri) (path->uri target))
+            (close! session target)
             (barrier session)
             (request! session 441 "textDocument/definition" a
                       (hasheq 'position (->jsexpr (Pos 2 0))))
             (define held (await gates))
             (check-equal? (hash-ref (response session 441) 'result) expected)
-            (check-false (sync/timeout 0 (acquire session doc-path)))
+            (check-false (sync/timeout 0 (acquire session target)))
             (release-gate! held)
-            (await-analysis (acquire session doc-path))
+            (await-analysis (acquire session target))
             (close! session a)
             (barrier session)))))))
 
